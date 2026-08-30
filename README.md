@@ -393,9 +393,3 @@ python src/09_hierarchical_clustering.py
 **Hardware note:** `04_engineered_model.py` is the most memory-intensive script (35 total XGBoost fits over the full feature set). On machines with <8GB RAM, make sure the float32-downcast fix (§4) is in place, or expect an OOM.
 
 ---
-
-## 10. Pending work
-
-- [ ] Add collaborator (friend) to the private GitHub repo
-- [ ] Friend imports `outputs/powerbi_export/*.csv` into Power BI, builds star-schema relationships in Model view, and creates Matrix/Slicer visuals demonstrating roll-up, drill-down, slice, and dice — required specifically because the professor wants the schema shown in Power BI, not just SQL
-- [ ] Share large gitignored files (`warehouse/sepsis.duckdb`, raw `.psv` data, `powerbi_export/` CSVs) via Google Drive, since these aren't suited to GitHub
