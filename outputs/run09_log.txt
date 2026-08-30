@@ -1,0 +1,14 @@
+Loaded 40,336 patient trajectory summaries
+Saved dendrogram to outputs/figures/hierarchical_dendrogram.png
+
+Hierarchical (Ward, k=2) silhouette: 0.110
+
+Cluster profile (mean values + sepsis rate):
+           HR_mean    HR_std  ...  is_ever_septic  n_patients
+cluster                       ...                            
+1        81.109524  8.687833  ...        0.064073         874
+2        85.862587  7.663874  ...        0.064831        1126
+
+[2 rows x 20 columns]
+
+Saved: hierarchical_cluster_profiles.csv

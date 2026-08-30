@@ -1,0 +1,12 @@
+Operating threshold (max normalized utility): 0.500
+
+Septic patients: 2932
+  Caught by at least one alert before/at onset: 87.6%
+  Median lead time among caught patients: 22.0 h
+  % of caught patients warned >= 6h ahead: 68.6%
+
+Alarm-fatigue comparison (matched sensitivity):
+                                rule  threshold  sensitivity  false_alarm_rate_nonseptic_hours
+                      naive_sirs_>=2        NaN     0.506126                          0.289024
+engineered_model_matched_sensitivity   0.568784     0.507236                          0.126792
+    engineered_model_operating_point   0.500000     0.599764                          0.179561

@@ -1,0 +1,2 @@
+model,auroc,auprc,best_threshold,normalized_utility,n_features
+baseline_raw_snapshot,0.7571900029263885,0.06341689489434296,0.5408333333333333,0.25035600340786396,15

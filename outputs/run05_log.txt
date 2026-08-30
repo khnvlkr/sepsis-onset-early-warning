@@ -1,0 +1,21 @@
+Top 15 features by mean |SHAP|:
+                         feature  mean_abs_shap
+                 Lactate_max_12h       0.252298
+              partial_sirs_score       0.125508
+        Lactate_hours_since_last       0.102888
+           Bilirubin_total_ffill       0.098059
+                     Temp_max_6h       0.092339
+Bilirubin_total_hours_since_last       0.088697
+                   Lactate_ffill       0.080358
+                      Temp_ffill       0.071151
+                   Resp_mean_12h       0.070991
+                    Temp_max_12h       0.065999
+                       BUN_ffill       0.057056
+                     shock_index       0.049986
+                     Temp_max_3h       0.049301
+                    Resp_min_12h       0.048614
+              Potassium_mean_12h       0.048352
+
+Saved case study for patient p107279 at hour 199 (SepsisLabel=1)
+
+Figures saved to /home/sash/Downloads/sepsis_capstone/outputs/figures

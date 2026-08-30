@@ -1,0 +1,20 @@
+# Virtual env
+.venv/
+
+# Raw data (huge — share via cloud instead)
+data/raw/
+
+# Warehouse binary
+warehouse/*.duckdb
+
+# Large exports for Power BI (share via cloud, not git)
+outputs/powerbi_export/
+outputs/*.parquet
+
+# Python cruft
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# OS junk
+.DS_Store

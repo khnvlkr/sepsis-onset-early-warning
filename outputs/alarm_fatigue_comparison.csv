@@ -1,0 +1,4 @@
+rule,threshold,sensitivity,false_alarm_rate_nonseptic_hours
+naive_sirs_>=2,,0.506125519415389,0.28902429583794204
+engineered_model_matched_sensitivity,0.5687844611528822,0.5072359936953719,0.12679246916933348
+engineered_model_operating_point,0.5,0.5997635764436166,0.17956050473202675

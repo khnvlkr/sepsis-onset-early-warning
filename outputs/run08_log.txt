@@ -1,0 +1,50 @@
+Loaded 1,552,210 rows for binning
+Flag prevalence:
+ HR_high          0.3300
+Temp_abnormal    0.1211
+Resp_high        0.2893
+SBP_low          0.1351
+WBC_abnormal     0.2949
+Lactate_high     0.0909
+Sepsis           0.0180
+dtype: float64
+
+Total rules found: 374
+Rules with Sepsis as consequent: 28
+
+Top 20 rules by lift (antecedent -> Sepsis):
+                                  antecedents                                  consequents  support  confidence     lift
+        frozenset({Resp_high, Temp_abnormal})                          frozenset({Sepsis}) 0.002058    0.050873 2.828706
+          frozenset({HR_high, Temp_abnormal})                          frozenset({Sepsis}) 0.002364    0.050635 2.815443
+         frozenset({WBC_abnormal, Resp_high})                 frozenset({HR_high, Sepsis}) 0.002076    0.020919 2.428614
+           frozenset({HR_high, WBC_abnormal})               frozenset({Sepsis, Resp_high}) 0.002076    0.017545 2.302645
+frozenset({HR_high, WBC_abnormal, Resp_high})                          frozenset({Sepsis}) 0.002076    0.041072 2.283720
+                   frozenset({Temp_abnormal})                 frozenset({HR_high, Sepsis}) 0.002364    0.019520 2.266204
+                   frozenset({Temp_abnormal})               frozenset({Sepsis, Resp_high}) 0.002058    0.016998 2.230894
+              frozenset({HR_high, Resp_high})            frozenset({WBC_abnormal, Sepsis}) 0.002076    0.015721 2.103701
+                   frozenset({Temp_abnormal})                          frozenset({Sepsis}) 0.004342    0.035859 1.993836
+         frozenset({WBC_abnormal, Resp_high})                          frozenset({Sepsis}) 0.003419    0.034445 1.915250
+              frozenset({HR_high, Resp_high})                          frozenset({Sepsis}) 0.004461    0.033779 1.878228
+                         frozenset({HR_high}) frozenset({WBC_abnormal, Sepsis, Resp_high}) 0.002076    0.006292 1.840269
+                       frozenset({Resp_high})   frozenset({HR_high, WBC_abnormal, Sepsis}) 0.002076    0.007177 1.837669
+           frozenset({HR_high, WBC_abnormal})                          frozenset({Sepsis}) 0.003905    0.032999 1.834865
+                       frozenset({Resp_high})                 frozenset({HR_high, Sepsis}) 0.004461    0.015420 1.790240
+                         frozenset({HR_high})               frozenset({Sepsis, Resp_high}) 0.004461    0.013519 1.774252
+                    frozenset({Lactate_high})                          frozenset({Sepsis}) 0.002766    0.030434 1.692234
+                         frozenset({HR_high})           frozenset({Sepsis, Temp_abnormal}) 0.002364    0.007163 1.649522
+                       frozenset({Resp_high})           frozenset({Sepsis, Temp_abnormal}) 0.002058    0.007114 1.638453
+                         frozenset({HR_high})            frozenset({WBC_abnormal, Sepsis}) 0.003905    0.011834 1.583537
+
+Compound (2+ flag) rules with Sepsis as consequent: 9
+                                  antecedents                       consequents  support  confidence     lift
+        frozenset({Resp_high, Temp_abnormal})               frozenset({Sepsis}) 0.002058    0.050873 2.828706
+          frozenset({HR_high, Temp_abnormal})               frozenset({Sepsis}) 0.002364    0.050635 2.815443
+         frozenset({WBC_abnormal, Resp_high})      frozenset({HR_high, Sepsis}) 0.002076    0.020919 2.428614
+           frozenset({HR_high, WBC_abnormal})    frozenset({Sepsis, Resp_high}) 0.002076    0.017545 2.302645
+frozenset({HR_high, WBC_abnormal, Resp_high})               frozenset({Sepsis}) 0.002076    0.041072 2.283720
+              frozenset({HR_high, Resp_high}) frozenset({WBC_abnormal, Sepsis}) 0.002076    0.015721 2.103701
+         frozenset({WBC_abnormal, Resp_high})               frozenset({Sepsis}) 0.003419    0.034445 1.915250
+              frozenset({HR_high, Resp_high})               frozenset({Sepsis}) 0.004461    0.033779 1.878228
+           frozenset({HR_high, WBC_abnormal})               frozenset({Sepsis}) 0.003905    0.032999 1.834865
+
+Saved: association_rules_all.csv, association_rules_sepsis.csv
