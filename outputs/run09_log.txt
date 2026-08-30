@@ -1,14 +1,32 @@
-Loaded 40,336 patient trajectory summaries
+Loaded 31,857 patient trajectory summaries (complete-case)
+
+COMPUTE-CONSTRAINT DISCLOSURE:
+  Ward-linkage hierarchical clustering requires an O(n^2) pairwise
+  distance matrix, which is not tractable on the full 31,857-patient
+  population on this machine (7.4GB RAM laptop -- a prior full-data run
+  in script 04 already triggered an OOM crash of the whole desktop session).
+  Hierarchical clustering below therefore runs on a stratified random
+  subsample of n=8,000 patients (seed=42),
+  stratified on is_ever_septic to preserve the sepsis rate. K-means
+  results are reported both on the full 31,857-patient population
+  AND on this identical 8,000-patient subsample, so the
+  two clustering methods can be compared on equal footing.
+  Sepsis rate -- full population: 0.0711, subsample: 0.0711
+
+Hierarchical (Ward, k=2, n=8,000) silhouette: 0.095
 Saved dendrogram to outputs/figures/hierarchical_dendrogram.png
 
-Hierarchical (Ward, k=2) silhouette: 0.110
-
-Cluster profile (mean values + sepsis rate):
+Hierarchical cluster profile (n=8,000 subsample):
            HR_mean    HR_std  ...  is_ever_septic  n_patients
 cluster                       ...                            
-1        81.109524  8.687833  ...        0.064073         874
-2        85.862587  7.663874  ...        0.064831        1126
+1        85.819032  8.023507  ...        0.076733        3245
+2        83.159225  8.651745  ...        0.067298        4755
 
 [2 rows x 20 columns]
 
-Saved: hierarchical_cluster_profiles.csv
+k-means (k=2) silhouette on the SAME 8,000-patient subsample: 0.157
+  (compare directly to the hierarchical silhouette above -- both methods
+   now share identical N, features, and scaling)
+k-means (k=2) silhouette on full population (n=31,857): 0.160
+
+Saved: hierarchical_cluster_profiles.csv, clustering_sample_manifest.csv

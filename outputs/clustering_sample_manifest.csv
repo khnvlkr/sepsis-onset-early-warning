@@ -1,0 +1,4 @@
+method,n_patients,sampling,seed,silhouette_k2
+hierarchical_ward,8000,stratified_by_is_ever_septic,42,0.09489525696784792
+kmeans_matched_subsample,8000,stratified_by_is_ever_septic,42,0.15650396748669873
+kmeans_full_population,31857,none (all complete-case patients),42,0.16027389593194966
