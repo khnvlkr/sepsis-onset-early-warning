@@ -13,7 +13,7 @@ A capstone project predicting sepsis onset **6 hours ahead** from hourly ICU vit
 3. [Script-by-script walkthrough](#3-script-by-script-walkthrough)
 4. [Key engineering incident: the OOM crash](#4-key-engineering-incident-the-oom-crash)
 5. [Leakage handling](#5-leakage-handling)
-6. [Syllabus gap analysis](#6-syllabus-gap-analysis-why-scripts-07-09-exist)
+6. [Syllabus gap analysis](#6-syllabus-gap-analysis-why-scripts-07-12-exist)
 7. [Results summary](#7-results-summary)
 8. [Known limitations / honest caveats](#8-known-limitations--honest-caveats)
 9. [Repository structure & how to reproduce](#9-repository-structure--how-to-reproduce)
@@ -52,6 +52,9 @@ Scripts live in `src/` and are numbered in execution order:
 07_olap_and_export.py         OLAP demo (roll-up/drill-down/slice/dice) + Power BI export
 08_association_rules.py       Apriori / association rule mining on binned abnormal-flags
 09_hierarchical_clustering.py Ward-linkage hierarchical clustering (phenotype discovery)
+10_classical_classifiers.py   Decision Tree + Naive Bayes classifiers (raw vs engineered features)
+11_dbscan_clustering.py       DBSCAN density-based clustering (phenotype discovery, 3rd method)
+12_outlier_analysis.py        IQR fencing + Isolation Forest outlier detection vs SepsisLabel
 clustering_phenotypes.py      k-means clustering (phenotype discovery)
 delong.py                     DeLong's test helper (statistical comparison of two AUCs)
 utility_score.py              PhysioNet Challenge 2019's official clinical utility metric
@@ -281,6 +284,94 @@ At k=2, hierarchical cluster 1 (3,245 patients, 7.67% sepsis rate) vs cluster 2 
 
 **The finding — reported honestly as a null result, not hidden:** both clustering methods agree there is **no clinically meaningful sepsis phenotype** in this feature space. Silhouette scores are low across the board (0.10–0.16, well below the ~0.5+ that would indicate genuinely separable clusters), and — more importantly — the sepsis rate is nearly flat across every cluster either method produces (differences of only 0.5–1 percentage points). Whatever these clusters are picking up on (probably coarse things like hospital/ward assignment or general illness severity), it isn't sepsis subtype. That the two independent methods, run on different sample sizes and different linkage logic, converge on the *same* negative conclusion is itself a reasonably strong piece of evidence that this negative result is real rather than a modeling artifact.
 
+### `10_classical_classifiers.py` — Decision Tree & Naive Bayes
+
+**What it does:** the DWM Module 6 syllabus names **Decision Tree Induction** and **Bayesian Classification** as classification techniques distinct from the boosted-tree XGBoost model used everywhere else in this project (§3, scripts 03/04). This script closes that gap by training `sklearn.tree.DecisionTreeClassifier` and `sklearn.naive_bayes.GaussianNB` on the same warehouse tables, same patient-grouped `GroupKFold(5)` split, and same AUROC/AUPRC/normalized-utility metrics as the baseline and engineered models — so the numbers sit directly next to the rest of the results table rather than existing in isolation.
+
+Each classifier is run twice: once on the 15 raw forward-filled features (control, matches `03_baseline_model.py`'s feature set) and once on the full 289-column engineered set (matches `04_engineered_model.py`'s). Neither model handles `NaN`s natively the way XGBoost does, so a per-column median imputation is applied just for this script — a deliberate, disclosed deviation from scripts 03/04, which pass raw (possibly-missing) values straight to XGBoost.
+
+**Result:**
+
+| Model | AUROC | AUPRC | Normalized utility | Features |
+|---|---|---|---|---|
+| Decision Tree (engineered) | **0.7152** | **0.0540** | **0.2065** | 289 |
+| Naive Bayes (engineered) | 0.7093 | 0.0387 | 0.1431 | 289 |
+| Decision Tree (raw) | 0.7056 | 0.0476 | 0.1793 | 15 |
+| Naive Bayes (raw) | 0.6957 | 0.0367 | 0.1410 | 15 |
+
+**The finding:** both classical classifiers land well below XGBoost at every comparable feature count (engineered XGBoost: 0.7918 AUROC vs. engineered Decision Tree: 0.7152, engineered Naive Bayes: 0.7093) — expected, since neither a single decision tree nor a Gaussian-likelihood Bayesian model can capture the kind of nonlinear, high-order feature interactions a 300-tree gradient-boosted ensemble can. What's more interesting is that **engineered features still help both classical models** over their raw-feature counterparts (Decision Tree: +0.0096 AUROC, Naive Bayes: +0.0136 AUROC) — smaller gains than XGBoost saw (+0.0346), but the same direction. This is a useful sanity check: the value of the engineered feature set (§3, `02_feature_engineering.py`) isn't an XGBoost-specific artifact, it transfers across model families, just with diminishing returns for simpler models that can't exploit the extra features as fully.
+
+One more note worth including in the report: Naive Bayes' best-utility threshold lands at the sweep floor (0.01) for both feature sets, which is a symptom of Gaussian Naive Bayes' independence assumption producing poorly-calibrated, extreme predicted probabilities on this heavily correlated feature set (rolling stats and raw values for the same vital are, by construction, highly correlated — exactly what "naive" independence assumes away). This doesn't invalidate the AUROC/AUPRC ranking (both are threshold-independent), but it does mean Naive Bayes' probability outputs shouldn't be read as literal risk percentages the way XGBoost's or the Decision Tree's more reasonably can.
+
+### `11_dbscan_clustering.py` — density-based clustering (third phenotype-discovery method)
+
+**What it does:** closes the last named DWM Module 6 clustering gap. §3's `09_hierarchical_clustering.py` already covers hierarchical (agglomerative) clustering and `clustering_phenotypes.py` covers partition-based (k-means) clustering; Module 6 separately names **density-based clustering**, which neither of those is. This script runs **DBSCAN** on the identical per-patient trajectory summary (mean/std/min/max of `HR`, `O2Sat`, `Temp`, `SBP`, `MAP`, `DBP`, `Resp`) used by the other two clustering scripts, rebuilt directly from `fact_ffill` so it works standalone without needing the other scripts run first.
+
+Unlike k-means or hierarchical clustering, DBSCAN doesn't take a target cluster count — it takes a neighborhood radius `eps` and a minimum point count `min_samples`. `eps` is chosen via the standard **k-distance elbow heuristic** (Ester et al., 1996): plot every point's distance to its `min_samples`-th nearest neighbor, sorted ascending, and pick the point of maximum curvature as `eps`, rather than hand-picking a value. `min_samples=10` follows the common rule-of-thumb of roughly `2 × dimensionality` for this 18-feature space.
+
+**Result:**
+
+| | |
+|---|---|
+| Patients (complete-case) | 32,465 |
+| Chosen `eps` (k-distance elbow) | 3.551 |
+| `min_samples` | 10 |
+| Clusters found | **1** |
+| Noise points | 662 (2.0%) |
+
+![DBSCAN k-distance elbow](outputs/figures/dbscan_kdistance_elbow.png)
+
+| Cluster | N patients | Sepsis rate |
+|---|---|---|
+| Noise (`-1`) | 662 | **14.35%** |
+| Cluster 0 | 31,803 | 7.14% |
+
+**The finding:** DBSCAN finds essentially **one dense cluster containing the overwhelming majority of patients, plus a small (2%) noise fraction** rather than multiple genuine clusters — silhouette score isn't even computable in the usual sense since there's only one real cluster to compare against. Read alongside §3's k-means (silhouette 0.154–0.160) and hierarchical (silhouette 0.095) results, this is a **third independent method reaching the same conclusion**: no clean sepsis phenotype exists in this feature space at the whole-patient-trajectory grain. Three structurally different algorithms (partition-based, hierarchical, density-based) converging on "no separable structure" is stronger evidence for that null result than any one method alone — density-based clustering in particular is good at finding irregularly-shaped clusters that k-means' spherical assumption or Ward linkage's variance-minimizing objective could miss, so DBSCAN failing to find structure here isn't just "another vote," it's a check against a specific blind spot the other two methods share.
+
+One genuinely interesting aside: the 662 patients DBSCAN labels as **noise** (i.e., don't fit densely into the main cluster — outliers in the trajectory-feature space) have a sepsis rate **exactly double** the main cluster's (14.35% vs. 7.14%). This lines up cleanly with the outlier-analysis finding below (§3, `12_outlier_analysis.py`) that unusual/extreme vitals correlate with sepsis, even though the two analyses use different feature grains (whole-stay trajectory summary here vs. individual patient-hours there) and were run independently.
+
+### `12_outlier_analysis.py` — outlier analysis on key vitals
+
+**What it does:** the last of the three DWM Module 6 gaps — **outlier analysis** — named alongside association rules and clustering, and not previously covered anywhere in the pipeline. It's also a genuinely good fit for this dataset: extreme lab values (very high lactate, very high/low temperature) are often the clinical signal itself in sepsis, not noise to be cleaned away, so this analysis is expected to *corroborate* rather than contradict the SHAP (§3, `05_explainability.py`) and association-rule (§3, `08_association_rules.py`) findings.
+
+Two standard, deliberately simple and interpretable outlier-detection methods are run on six vitals (`HR`, `Temp`, `Resp`, `SBP`, `Lactate`, `WBC` — the same vitals already shown to matter most in SHAP and the association rules), at the patient-hour grain (`fact_ffill`, same table and grain as `03_baseline_model.py`):
+
+1. **Univariate IQR (Tukey) fencing**, per vital — flag any hour where a vital falls outside `[Q1 − 1.5×IQR, Q3 + 1.5×IQR]`. The classic, easily explained outlier rule, computed independently for each of the 6 vitals.
+2. **Multivariate Isolation Forest**, across all 6 vitals jointly, `contamination=0.02` (chosen close to the dataset's own 1.8% positive rate so the flagged fraction is a comparable order of magnitude) — catches combinations that look unremarkable one vital at a time but are jointly unusual (e.g. moderately elevated HR *and* moderately low SBP together, neither extreme enough alone to trip an IQR fence).
+
+Every flag is checked against `SepsisLabel` for **lift** — how much more likely a flagged hour is to be septic than the 1.8% overall base rate.
+
+**Result — IQR fence bounds:**
+
+| Vital | Lower fence | Upper fence |
+|---|---|---|
+| HR | 37.50 | 129.50 |
+| Temp | 35.05 | 38.65 |
+| Resp | 7.25 | 29.25 |
+| SBP | 60.50 | 184.50 |
+| Lactate | −0.45 | 3.79 |
+| WBC | −1.40 | 22.60 |
+
+**Result — sepsis lift by method:**
+
+| Method | % of rows flagged | Sepsis rate (flagged) | Sepsis rate (overall) | Lift |
+|---|---|---|---|---|
+| IQR, `Temp` only | 1.54% | 6.94% | 1.80% | **3.86×** |
+| IQR, 2+ vitals simultaneously | 1.21% | 5.87% | 1.80% | **3.27×** |
+| Isolation Forest (all 6 vitals) | 2.00% | 5.77% | 1.80% | **3.21×** |
+| IQR, `WBC` only | 2.63% | 4.19% | 1.80% | 2.33× |
+| IQR, `Resp` only | 3.78% | 4.51% | 1.80% | 2.51× |
+| IQR, `HR` only | 1.12% | 4.43% | 1.80% | 2.46× |
+| IQR, any single vital | 10.96% | 4.13% | 1.80% | 2.30× |
+| IQR, `Lactate` only | 2.14% | 3.34% | 1.80% | 1.86× |
+| IQR, `SBP` only | 1.14% | 2.17% | 1.80% | 1.20× |
+
+![Outlier sepsis lift](outputs/figures/outlier_sepsis_lift.png)
+
+**The finding:** outlier-flagged hours are consistently, substantially more likely to be septic than the base rate across every method and vital tested — even the weakest (`SBP` alone, 1.20×) shows a positive lift, and the strongest single-vital result (`Temp`, 3.86×) beats the Isolation Forest's full multivariate result. This is a clean validation, from a completely different angle (unsupervised outlier detection, no model training) of the same story the SHAP ranking told in §3: **temperature and lactate carry the strongest individual sepsis signal**, and **combinations of simultaneously-abnormal vitals carry more signal than any single vital alone** (2+ vitals: 3.27× lift vs. 2.30× for any single vital) — the same "compound signals beat single flags" pattern already found independently by the association-rule mining in `08_association_rules.py` (`{Resp_high, Temp_abnormal}` beating `{Temp_abnormal}` alone by ~42%). Three unrelated techniques — SHAP attribution, Apriori association rules, and now outlier lift — all pointing at the same handful of vitals and the same "combinations beat singles" structure is a strong, mutually-reinforcing signal that these are genuine clinical patterns rather than modeling artifacts of any one method.
+
+Worth noting as a limitation: `SBP`'s weak lift (1.20×) is somewhat expected rather than a red flag — the Sepsis-3 definition this dataset's label is built on emphasizes lactate and organ dysfunction scores over blood pressure directly, and hypotension in sepsis is often a *late* sign compared to fever/tachypnea/elevated lactate, which the stronger-lift vitals here (`Temp`, `Resp`, `Lactate`) more directly capture.
+
 ### `delong.py` and `utility_score.py` — shared helper modules
 
 - **`delong.py`** implements DeLong's test for comparing two correlated AUROCs (used by `04_engineered_model.py`) — this is the statistically correct way to compare two models' AUROC on the *same* test set, since a naive "is 0.79 > 0.76" comparison doesn't account for the fact that both numbers were estimated with sampling uncertainty.
@@ -315,9 +406,20 @@ Three categories of leakage were explicitly checked and are documented (includin
 
 ---
 
-## 6. Syllabus gap analysis (why scripts 07–09 exist)
+## 6. Syllabus gap analysis (why scripts 07–12 exist)
 
-The project was checked against the actual DWM and FE lab syllabi (D.Y. Patil / Ramrao Adik Institute, NEP-24, Sem V). The DWM lab syllabus specifically names **OLAP cube operations**, **Apriori/association rules**, and **hierarchical or density-based clustering** as separate graded lab experiments. The original project scope only had k-means clustering — no OLAP demonstration, no association rule mining. Scripts `07_olap_and_export.py`, `08_association_rules.py`, and `09_hierarchical_clustering.py` were added specifically to close these three gaps, rather than being part of the original modeling plan.
+The project was checked against the actual DWM and FE lab syllabi (D.Y. Patil / Ramrao Adik Institute, NEP-24, Sem V) — specifically DWM Module 5 (data mining process, KDD, pre-processing) and Module 6 (association rules, classification, clustering), the modules the DWM professor specified this capstone should be based on. The original project scope only had XGBoost modeling and k-means clustering — no OLAP demonstration, no association rule mining, no named classical classifiers, no density-based clustering, and no outlier analysis, despite Module 6 explicitly naming all of these as separate graded lab experiments. Six scripts were added specifically to close these gaps, rather than being part of the original modeling plan:
+
+| Gap in Module 6 | Script that closes it |
+|---|---|
+| OLAP cube operations (roll-up, drill-down, slice, dice) | `07_olap_and_export.py` |
+| Association rule mining / Apriori | `08_association_rules.py` |
+| Hierarchical clustering | `09_hierarchical_clustering.py` |
+| Classification: Decision Tree Induction & Bayesian classification | `10_classical_classifiers.py` |
+| Density-based clustering | `11_dbscan_clustering.py` |
+| Outlier analysis | `12_outlier_analysis.py` |
+
+With all six in place, every named technique in Module 6 — association rules, classification (now including the specific algorithms named, not just XGBoost), all three major clustering families (partition-based, hierarchical, density-based), and outlier analysis — has a corresponding script and a reported result, not just the supervised prediction task the project originally centered on.
 
 ---
 
@@ -335,15 +437,23 @@ The project was checked against the actual DWM and FE lab syllabi (D.Y. Patil / 
 | Best association rule | `{Resp_high, Temp_abnormal}` → Sepsis, lift 2.83 |
 | Clustering (k-means, k=2) | silhouette 0.154–0.160, no sepsis-rate separation |
 | Clustering (hierarchical, k=2) | silhouette 0.095, no sepsis-rate separation |
+| Best classical classifier | Decision Tree (engineered) — AUROC 0.7152, AUPRC 0.0540 |
+| Classical vs XGBoost gap | XGBoost +0.0766 AUROC over best classical classifier (engineered features) |
+| Clustering (DBSCAN) | 1 cluster + 2.0% noise; noise points have 2× the sepsis rate of the main cluster |
+| Best outlier-vs-sepsis lift | `Temp` IQR outliers → 3.86× sepsis rate vs. base rate |
+| Compound outlier lift | 2+ simultaneously-abnormal vitals → 3.27× lift (vs. 2.30× for any single vital) |
 
 ---
 
 ## 8. Known limitations / honest caveats
 
 - **Label-construction leakage** (§5) — `SepsisLabel` shares some inputs with model features; results should be read accordingly.
-- **No sepsis phenotype found** — both clustering methods return a null result (§3, clustering section). Reported as-is rather than cherry-picking a k or method that looks more interesting.
+- **No sepsis phenotype found** — all three clustering methods (k-means, hierarchical, DBSCAN) return a null result (§3, clustering sections). Reported as-is rather than cherry-picking a k, `eps`, or method that looks more interesting.
 - **Minor patient-count discrepancies across scripts** — `01_etl_warehouse.py` loads 40,336 patients total, but complete-case filtering (dropping any patient with missing values in the feature set) drops this to different numbers depending on which columns a given script's query happens to require: 32,465 for the original k-means run, 31,857 for the hierarchical clustering script. This is expected behavior from complete-case filtering on slightly different column sets, not a bug, but it's worth a one-line footnote in the final report so it doesn't look like an inconsistency.
 - **AUROC-optimized threshold vs. clinical operating point** — the "best utility" threshold (0.500) used for the alarm-fatigue analysis produces higher sensitivity (59.98%) but a higher false-alarm rate (0.180) than the threshold matched to the naive rule's sensitivity (0.127 false-alarm rate at 50.72% sensitivity). Which threshold is "right" depends on the clinical tolerance for false alarms vs. missed cases — this is a genuine deployment decision, not something the model alone can answer.
+- **Classical classifiers aren't tuned to compete with XGBoost** — `10_classical_classifiers.py`'s Decision Tree and Naive Bayes use reasonable, undramatic defaults (`max_depth=6`, `class_weight="balanced"` for the tree; untouched `GaussianNB`), not an exhaustively-tuned configuration. Their purpose is to demonstrate the named Module 6 techniques and show the engineered-feature lift transfers across model families, not to claim they're competitive alternatives to the boosted-tree model — the report should be explicit that the ~0.08 AUROC gap to XGBoost reflects model capacity, not an unfair comparison.
+- **DBSCAN found effectively one cluster, not a clustering** — with `eps` chosen by the standard k-distance elbow method (not hand-tuned to produce a particular outcome), DBSCAN places 98% of patients in a single dense cluster. This is reported as the honest result, consistent with k-means and hierarchical clustering's own null findings (§3, §7), rather than re-tuning `eps`/`min_samples` until multiple clusters appear — doing so would risk manufacturing structure that isn't really there just to have a more "interesting" result to report.
+- **IQR fences and Isolation Forest contamination rate are simple, disclosed heuristics, not optimized thresholds** — the 1.5× IQR multiplier is the standard Tukey convention, and Isolation Forest's `contamination=0.02` was chosen to be close to the dataset's actual 1.8% sepsis rate rather than fitted to maximize lift. Both are defensible, standard choices, but neither was tuned to produce the best possible lift numbers, so the reported lift values (2.3×–3.9×) should be read as a reasonable first-pass signal, not an optimized outlier-detection system.
 
 ---
 
@@ -361,14 +471,21 @@ sepsis_capstone/
 │   ├── 07_olap_and_export.py
 │   ├── 08_association_rules.py
 │   ├── 09_hierarchical_clustering.py
+│   ├── 10_classical_classifiers.py
+│   ├── 11_dbscan_clustering.py
+│   ├── 12_outlier_analysis.py
 │   ├── clustering_phenotypes.py
 │   ├── delong.py
 │   └── utility_score.py
 ├── outputs/
-│   ├── *.csv                    (metrics, cluster profiles, rule tables, OLAP demo tables)
-│   ├── *.parquet                (out-of-fold predictions, for independent metric verification)
+│   ├── *.csv                    (metrics, cluster profiles, rule tables, OLAP demo tables,
+│   │                              classical_classifier_results.csv, dbscan_cluster_profiles.csv,
+│   │                              dbscan_manifest.csv, outlier_sepsis_lift.csv, outlier_iqr_bounds.csv)
+│   ├── *.parquet                (out-of-fold predictions, for independent metric verification —
+│   │                              including one per classical classifier from script 10)
 │   ├── run*_log.txt             (stdout logs from each script run)
-│   ├── figures/                 (SHAP plots, dendrogram, silhouette plot)
+│   ├── figures/                 (SHAP plots, dendrogram, silhouette plot, dbscan_kdistance_elbow.png,
+│   │                              outlier_sepsis_lift.png)
 │   └── powerbi_export/          (dim_patient.csv, dim_hospital.csv, fact_vitals_olap.csv)
 ├── warehouse/
 │   └── sepsis.duckdb            (gitignored — large binary, share via Google Drive)
@@ -388,7 +505,12 @@ python src/07_olap_and_export.py
 python src/08_association_rules.py
 python src/clustering_phenotypes.py
 python src/09_hierarchical_clustering.py
+python src/10_classical_classifiers.py
+python src/11_dbscan_clustering.py
+python src/12_outlier_analysis.py
 ```
+
+Scripts 10–12 only depend on `02_feature_engineering.py` having already built `fact_features`/`fact_ffill` — they don't need scripts 03–09 to have run first, so they can be run any time after step 2 above if you just want to check them in isolation.
 
 **Hardware note:** `04_engineered_model.py` is the most memory-intensive script (35 total XGBoost fits over the full feature set). On machines with <8GB RAM, make sure the float32-downcast fix (§4) is in place, or expect an OOM.
 

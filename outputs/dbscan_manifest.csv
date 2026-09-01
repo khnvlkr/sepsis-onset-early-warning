@@ -1,0 +1,2 @@
+method,n_patients,eps,min_samples,n_clusters,n_noise,noise_pct,silhouette_non_noise
+dbscan,32465,3.5512062170365466,10,1,662,2.0391190512860002,
