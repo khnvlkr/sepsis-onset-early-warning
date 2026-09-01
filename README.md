@@ -15,9 +15,10 @@ A capstone project predicting sepsis onset **6 hours ahead** from hourly ICU vit
 5. [Leakage handling](#5-leakage-handling)
 6. [Syllabus gap analysis](#6-syllabus-gap-analysis-why-scripts-07-12-exist)
 7. [Results summary](#7-results-summary)
-8. [Known limitations / honest caveats](#8-known-limitations--honest-caveats)
-9. [Repository structure & how to reproduce](#9-repository-structure--how-to-reproduce)
-10. [Pending work](#10-pending-work)
+8. [Fairness, generalization & uncertainty quantification](#8-fairness-generalization--uncertainty-quantification-why-scripts-13-15-exist)
+9. [Known limitations / honest caveats](#9-known-limitations--honest-caveats)
+10. [Repository structure & how to reproduce](#10-repository-structure--how-to-reproduce)
+11. [Pending work](#11-pending-work)
 
 ---
 
@@ -55,6 +56,9 @@ Scripts live in `src/` and are numbered in execution order:
 10_classical_classifiers.py   Decision Tree + Naive Bayes classifiers (raw vs engineered features)
 11_dbscan_clustering.py       DBSCAN density-based clustering (phenotype discovery, 3rd method)
 12_outlier_analysis.py        IQR fencing + Isolation Forest outlier detection vs SepsisLabel
+13_fairness_audit.py          subgroup AUROC/AUPRC/utility audit across age, gender, hospital
+14_cross_hospital_generalization.py  train-on-one-hospital / test-on-the-other generalization test
+15_conformal_prediction.py    MAPIE split-conformal classification with 90% coverage guarantee
 clustering_phenotypes.py      k-means clustering (phenotype discovery)
 delong.py                     DeLong's test helper (statistical comparison of two AUCs)
 utility_score.py              PhysioNet Challenge 2019's official clinical utility metric
@@ -372,10 +376,92 @@ Every flag is checked against `SepsisLabel` for **lift** — how much more likel
 
 Worth noting as a limitation: `SBP`'s weak lift (1.20×) is somewhat expected rather than a red flag — the Sepsis-3 definition this dataset's label is built on emphasizes lactate and organ dysfunction scores over blood pressure directly, and hypotension in sepsis is often a *late* sign compared to fever/tachypnea/elevated lactate, which the stronger-lift vitals here (`Temp`, `Resp`, `Lactate`) more directly capture.
 
+### `13_fairness_audit.py` — subgroup performance audit
+
+**What it does:** re-scores the engineered model's out-of-fold predictions, but this time grouped by three demographic/site axes — `age_bracket`, `gender_label`, `hospital_label` — computing AUROC, AUPRC, and normalized utility separately per subgroup, and reporting the largest within-axis gap for each. This is the standard "does the model work equally well for everyone?" audit any clinical ML model needs before deployment can even be discussed, and it directly follows on from the demographic dimensions already sitting in `dim_patient` from script 01.
+
+**Result — by subgroup:**
+
+| Axis | Group | n patients | AUROC | AUPRC | Normalized utility |
+|---|---|---|---|---|---|
+| Age bracket | <40 | 4,379 | 0.7883 | 0.0738 | 0.3063 |
+| Age bracket | 40–59 | 12,489 | 0.7903 | 0.0856 | 0.3158 |
+| Age bracket | **60–74** (best AUROC) | 14,073 | **0.8015** | 0.0836 | 0.3462 |
+| Age bracket | **75+** (worst AUROC) | 9,395 | **0.7811** | 0.0813 | 0.2944 |
+| Gender | Female | 17,770 | 0.7920 | 0.0802 | 0.2914 |
+| Gender | Male | 22,566 | 0.7915 | 0.0836 | 0.3401 |
+| Hospital | **hospital_system_2** (best AUROC) | 20,000 | **0.8084** | 0.0805 | 0.2966 |
+| Hospital | **hospital_system_1** (worst AUROC) | 20,336 | **0.7718** | 0.0837 | 0.3350 |
+
+**Gap summary, largest AUROC spread first:**
+
+| Axis | Max group | Max AUROC | Min group | Min AUROC | Gap |
+|---|---|---|---|---|---|
+| `hospital_label` | hospital_system_2 | 0.8084 | hospital_system_1 | 0.7718 | **0.0366** |
+| `age_bracket` | 60–74 | 0.8015 | 75+ | 0.7811 | 0.0204 |
+| `gender_label` | Female | 0.7920 | Male | 0.7915 | 0.0005 |
+
+**The headline finding:** gender shows essentially no AUROC disparity (0.0005 gap — noise-level), but **hospital site** is by far the largest fairness axis (0.0366 gap), nearly double the age-bracket gap (0.0204). The oldest patients (75+) are both the worst-served age group by AUROC *and* the group where a missed or late sepsis call is arguably most consequential, which is worth flagging explicitly as a deployment caveat rather than just a number in a table.
+
+**A more important, easy-to-miss finding — AUROC parity does not imply utility parity.** Looking at normalized utility (the metric that actually reflects clinical value) instead of AUROC alone flips two of the three rankings:
+
+- **Hospital:** `hospital_system_2` has the *higher* AUROC (0.8084) but the *lower* utility (0.2966); `hospital_system_1` has the *lower* AUROC (0.7718) but the *higher* utility (0.3350). A single shared decision threshold interacts with each hospital's local prevalence and score distribution differently, so the hospital that ranks patients better in relative terms (AUROC) isn't necessarily the hospital where the model's alerts translate into better time-weighted outcomes.
+- **Gender:** near-identical AUROC (0.7920 vs 0.7915) but a large utility gap (0.2914 for Female vs 0.3401 for Male, a ~17% relative difference) — the ranking-quality metric says "no disparity," while the deployment-relevant metric says otherwise.
+- **Age** is the one axis where AUROC and utility agree directionally (60–74 best on both, 75+ worst on both), which makes it the most straightforwardly interpretable of the three gaps.
+
+A fairness audit that stopped at AUROC would have reported "gender: fine, hospital: some gap, age: some gap" and missed that the threshold-dependent utility metric tells a materially different — and, for a deployment-facing document, more relevant — story. That's why both metrics are reported side by side here rather than just one.
+
+### `14_cross_hospital_generalization.py` — does the model transfer across hospital systems?
+
+**What it does:** a stricter generalization test than ordinary k-fold cross-validation. Instead of training and testing on a random patient-level split drawn from *both* hospitals (as every prior script does), this trains on **one hospital entirely** and tests on **the other hospital entirely**, in both directions, and compares against the in-distribution (mixed-hospital) result already on file from `04_engineered_model.py`.
+
+**Result:**
+
+| Direction | Train n | Test n | AUROC | AUPRC | Best-threshold utility |
+|---|---|---|---|---|---|
+| A: train hospital 1 → test hospital 2 | 20,336 | 20,000 | 0.7381 | 0.0545 | 0.1931 (threshold 0.54) |
+| B: train hospital 2 → test hospital 1 | 20,000 | 20,336 | 0.7226 | 0.0609 | 0.2439 (threshold 0.46) |
+| In-distribution (mixed, `GroupKFold`) | — | — | **0.7918** | **0.0821** | **0.3203** |
+
+**The headline finding:** generalizing across hospital systems costs the model **0.05–0.07 AUROC and roughly 25–40% of its clinical utility**, relative to the in-distribution result. Utility takes the harder hit than AUROC in both directions (utility drops 40% in direction A, 24% in direction B, vs. AUROC drops of 7% and 9% respectively) — consistent with utility being threshold-sensitive and thus more exposed to a shift in the *score distribution* between hospitals, not just a shift in ranking quality.
+
+This result is the direct causal explanation for the hospital-axis gap already surfaced in `13_fairness_audit.py`: a mixed-hospital model trained with `GroupKFold` sees both hospitals during training, and the 0.0366 AUROC gap in the fairness audit is what's left over from site-specific distribution shift *even after* training on both. This cross-hospital experiment isolates that same shift in its more extreme form — what happens if the model has *never seen the target hospital at all* — and shows the gap roughly doubles (0.05–0.07 vs. 0.0366) under that harder condition. Read together, §8's fairness audit and this generalization test tell one consistent story: hospital site is a real, non-trivial source of distribution shift in this dataset, more so than age or gender, and a model trained at one site should not be assumed to transfer to another without re-validation.
+
+**Practical implication:** if this model were ever deployed at a hospital not represented in the training data, these numbers — not the headline 0.7918 in-distribution AUROC — are the honest expectation for out-of-the-box performance, and local recalibration/threshold-tuning at minimum, ideally a hospital-specific fine-tune, should be treated as a deployment prerequisite rather than a nice-to-have.
+
+### `15_conformal_prediction.py` — calibrated uncertainty via split conformal classification
+
+**What it does:** wraps the engineered XGBoost model with **split conformal prediction** (via the [MAPIE](https://mapie.readthedocs.io/) library's `SplitConformalClassifier`) to produce, for every patient-hour, a *prediction set* rather than a single point probability — i.e., instead of "12% chance of sepsis," the output is a set like `{no-sepsis}`, `{sepsis}`, or `{no-sepsis, sepsis}` (both, meaning "the model is not confident enough to commit"), with a **distribution-free statistical guarantee** that the true label falls inside the predicted set at least 90% of the time (`confidence_level=0.9`), regardless of the underlying model's calibration quality.
+
+**Data split** (three-way, on top of the usual patient-level grouping): 24,201 patients / 932,292 rows for training the base model, 8,067 patients / 309,265 rows held out purely for **conformal calibration** (computing the nonconformity-score threshold), and 8,068 patients / 310,653 rows for the final test evaluation — calibration and test sets must be disjoint from each other and from training for the coverage guarantee to hold.
+
+**Result:**
+
+| Metric | Value |
+|---|---|
+| Target confidence level | 90% |
+| **Empirical coverage** (true label in set) | **89.74%** |
+| Confident "no sepsis" (singleton set) | 72.94% of hours |
+| Confident "sepsis" (singleton set) | 10.51% of hours |
+| **Uncertain** (`{both}`, flagged for review) | **16.56% of hours** |
+| Empty set (should essentially never happen) | 0.00% of hours |
+| Accuracy on confident hours | **87.71%** |
+| Accuracy on uncertain hours | **57.52%** |
+| Normalized utility, full test cohort | 0.3217 |
+| Normalized utility, confident hours only | **0.3871** |
+
+**The headline finding — empirical coverage matches the target almost exactly:** 89.74% observed vs. 90% target is well within expected sampling noise for a calibration set of this size, which is exactly what a correctly-implemented split conformal method should produce. This is the whole point of conformal prediction over an ad-hoc probability threshold: the 90% guarantee isn't a hope, it's a property that's been empirically checked and holds.
+
+**The uncertainty flag is doing real work, not just padding:** accuracy on the 16.56% of hours flagged as uncertain (57.52%) is barely better than a coin flip, while accuracy on the 83.44% of hours the model is confident about is 87.71% — a **30-point accuracy gap**. This is precisely the desired behavior: the conformal set isn't just adding noise, it's correctly identifying the subset of patient-hours where the point prediction is unreliable, which is the actionable clinical signal ("route this patient-hour to a human for a second look") that a bare probability score doesn't give you.
+
+**Restricting to confident predictions raises clinical utility by ~20%:** normalized utility on the confident-only subset (0.3871) is notably higher than on the full test cohort (0.3217, which is itself consistent with the 0.3203 in-distribution result from `04_engineered_model.py` — a useful cross-check that this held-out split reproduces the earlier headline number). In a real deployment, this suggests a two-tier alerting design: act automatically/high-confidence on the ~83% of hours the model is sure about, and route the ~17% flagged as uncertain to clinician review rather than trusting the point estimate blindly — the empty-set rate of exactly 0.00% also confirms the conformal procedure never produces a degenerate "neither label is plausible" output, which would be hard to act on operationally.
+
+**Engineering note:** this script depends on the `mapie` package (`pip install "mapie>=1.0"`, added to `requirements.txt`), which is not required by any other script in the pipeline — worth calling out in setup instructions so a fresh clone doesn't fail on `ModuleNotFoundError: No module named 'mapie'` the way the first run here did.
+
 ### `delong.py` and `utility_score.py` — shared helper modules
 
 - **`delong.py`** implements DeLong's test for comparing two correlated AUROCs (used by `04_engineered_model.py`) — this is the statistically correct way to compare two models' AUROC on the *same* test set, since a naive "is 0.79 > 0.76" comparison doesn't account for the fact that both numbers were estimated with sampling uncertainty.
-- **`utility_score.py`** implements the PhysioNet/CinC 2019 Challenge's own **clinical utility metric** — a time-weighted scoring function that rewards early true-positive predictions, penalizes false positives, and penalizes late/missed true positives, normalized so a perfect predictor scores 1.0 and a "never predict sepsis" predictor scores 0.0. This is a more clinically meaningful headline number than AUROC alone, which is why it's reported alongside AUROC/AUPRC for both the baseline (0.2504) and engineered (0.3203) models.
+- **`utility_score.py`** implements the PhysioNet/CinC 2019 Challenge's own **clinical utility metric** — a time-weighted scoring function that rewards early true-positive predictions, penalizes false positives, and penalizes late/missed true positives, normalized so a perfect predictor scores 1.0 and a "never predict sepsis" predictor scores 0.0. This is a more clinically meaningful headline number than AUROC alone, which is why it's reported alongside AUROC/AUPRC throughout the project — including the fairness audit, cross-hospital test, and conformal prediction results in §8.
 
 ---
 
@@ -442,10 +528,31 @@ With all six in place, every named technique in Module 6 — association rules, 
 | Clustering (DBSCAN) | 1 cluster + 2.0% noise; noise points have 2× the sepsis rate of the main cluster |
 | Best outlier-vs-sepsis lift | `Temp` IQR outliers → 3.86× sepsis rate vs. base rate |
 | Compound outlier lift | 2+ simultaneously-abnormal vitals → 3.27× lift (vs. 2.30× for any single vital) |
+| Largest fairness gap (AUROC) | hospital site, 0.0366 (h2=0.8084 vs h1=0.7718) |
+| AUROC-vs-utility disconnect | gender AUROC gap ≈0, but utility gap ≈17% relative |
+| Cross-hospital generalization (avg. of both directions) | AUROC ≈0.73, utility ≈0.22 (vs. 0.7918 / 0.3203 in-distribution) |
+| Conformal coverage (target 90%) | 89.74% empirical |
+| Conformal uncertain-hour flag rate | 16.56% of hours |
+| Accuracy: confident vs. uncertain hours (conformal) | 87.71% vs. 57.52% |
+| Utility, confident-only subset vs. full cohort (conformal) | 0.3871 vs. 0.3217 (+~20%) |
 
 ---
 
-## 8. Known limitations / honest caveats
+## 8. Fairness, generalization & uncertainty quantification (why scripts 13–15 exist)
+
+Scripts `01`–`12` answer "can this be predicted, and how well" (a modeling question) plus the Module 6 syllabus requirements (§6). Scripts `13`–`15` answer a different, arguably more important question for anything touching real patients: **where does this model quietly fail, and does it know when it doesn't know?** Unlike scripts 07–12, these three weren't added to close a named syllabus gap — they were added to move the project from "here's a model with a good AUROC" toward "here's a model whose failure modes, subgroup behavior, and calibrated uncertainty have actually been characterized," which is the standard a clinical ML project needs to meet before deployment is even a reasonable conversation.
+
+1. **Does performance vary by who the patient is or which hospital they're in?** (`13_fairness_audit.py`) — yes, and the largest gap is by hospital site (0.0366 AUROC), not by age (0.0204) or gender (0.0005). More importantly, ranking-quality parity (AUROC) and clinical-value parity (normalized utility) don't always move together — gender looks fine on AUROC but shows a 17%-relative utility gap, and the hospital with the *better* AUROC has the *worse* utility. A fairness audit that only checks AUROC would have missed both of these.
+
+2. **Does the model actually transfer to a hospital it has never seen?** (`14_cross_hospital_generalization.py`) — no, not cleanly. Training on one hospital and testing on the other costs 0.05–0.07 AUROC and 25–40% of clinical utility relative to the in-distribution result, a substantially bigger drop than the 0.0366 in-distribution hospital gap from the fairness audit. Read together, these two scripts show the same underlying phenomenon (hospital-site distribution shift) at two different intensities: partially mitigated when the model trains on both hospitals (script 13's fairness audit), and much more exposed when it's forced to generalize from one to the other with zero exposure to the target site (script 14, this one).
+
+3. **When the model is wrong, does it at least know it's uncertain?** (`15_conformal_prediction.py`) — yes, reliably. The conformal wrapper hits its 90% coverage target almost exactly (89.74% empirical), and the 16.56% of hours it flags as "uncertain" have a 30-point-lower accuracy (57.52% vs. 87.71%) than the hours it's confident about. That gap is the practically useful part: it means the uncertainty flag is a real, actionable signal for routing hours to human review, not statistical noise — and restricting the utility calculation to confident hours only lifts normalized utility by roughly 20% (0.3871 vs. 0.3217), a concrete illustration of what a "model + human-in-the-loop on uncertain cases" deployment pattern could buy in practice.
+
+**The combined takeaway for a deployment-facing reader:** the single headline AUROC (0.7918) understates how unevenly this model performs across hospital sites and, to a lesser extent, age groups, and overstates how well it would perform at a hospital it wasn't trained on. Conformal prediction offers a partial mitigation — not for the fairness gap itself, but for the more general problem of not knowing which predictions to trust — by explicitly separating "confident enough to act on" from "needs a second opinion," a meaningfully different (and more honest) product than a single probability threshold.
+
+---
+
+## 9. Known limitations / honest caveats
 
 - **Label-construction leakage** (§5) — `SepsisLabel` shares some inputs with model features; results should be read accordingly.
 - **No sepsis phenotype found** — all three clustering methods (k-means, hierarchical, DBSCAN) return a null result (§3, clustering sections). Reported as-is rather than cherry-picking a k, `eps`, or method that looks more interesting.
@@ -454,10 +561,14 @@ With all six in place, every named technique in Module 6 — association rules, 
 - **Classical classifiers aren't tuned to compete with XGBoost** — `10_classical_classifiers.py`'s Decision Tree and Naive Bayes use reasonable, undramatic defaults (`max_depth=6`, `class_weight="balanced"` for the tree; untouched `GaussianNB`), not an exhaustively-tuned configuration. Their purpose is to demonstrate the named Module 6 techniques and show the engineered-feature lift transfers across model families, not to claim they're competitive alternatives to the boosted-tree model — the report should be explicit that the ~0.08 AUROC gap to XGBoost reflects model capacity, not an unfair comparison.
 - **DBSCAN found effectively one cluster, not a clustering** — with `eps` chosen by the standard k-distance elbow method (not hand-tuned to produce a particular outcome), DBSCAN places 98% of patients in a single dense cluster. This is reported as the honest result, consistent with k-means and hierarchical clustering's own null findings (§3, §7), rather than re-tuning `eps`/`min_samples` until multiple clusters appear — doing so would risk manufacturing structure that isn't really there just to have a more "interesting" result to report.
 - **IQR fences and Isolation Forest contamination rate are simple, disclosed heuristics, not optimized thresholds** — the 1.5× IQR multiplier is the standard Tukey convention, and Isolation Forest's `contamination=0.02` was chosen to be close to the dataset's actual 1.8% sepsis rate rather than fitted to maximize lift. Both are defensible, standard choices, but neither was tuned to produce the best possible lift numbers, so the reported lift values (2.3×–3.9×) should be read as a reasonable first-pass signal, not an optimized outlier-detection system.
+- **Hospital-site performance gap, both in-distribution and out-of-distribution** (§8) — the model is measurably worse for `hospital_system_1` by AUROC (though better by utility — see §8's discussion of the AUROC/utility disconnect), and generalizes poorly to a hospital it wasn't trained on (AUROC drops to 0.72–0.74, utility drops 25–40%). Any deployment at a new site should treat the in-distribution 0.7918 AUROC as an optimistic ceiling, not an expectation.
+- **75+ age group is both the worst-served and arguably the highest-stakes group** (§8) — a 0.02 AUROC gap sounds small in isolation, but it's the largest age-bracket gap observed, on the subgroup where a missed sepsis alert plausibly carries the most clinical risk. Worth flagging explicitly rather than averaging it away in an overall AUROC.
+- **Conformal guarantee is marginal, not conditional** (§8) — the 90% coverage guarantee from `15_conformal_prediction.py` holds on average across the whole calibration/test distribution, not provably per-subgroup. Given the fairness gaps found by `13_fairness_audit.py` (§8), it would be worth checking in a follow-up whether coverage holds equally well within each hospital/age subgroup, or whether the "uncertain" flag is itself unevenly distributed across those same groups — this hasn't been checked yet.
+- **`mapie` is a new pipeline dependency** (§3, script 15) — not required by any other script, so it's easy for a fresh environment to miss it; make sure `requirements.txt` is followed exactly (`pip install -r requirements.txt`) rather than reproducing scripts 01–12's environment and assuming it's sufficient for script 15.
 
 ---
 
-## 9. Repository structure & how to reproduce
+## 10. Repository structure & how to reproduce
 
 ```
 sepsis_capstone/
@@ -474,21 +585,28 @@ sepsis_capstone/
 │   ├── 10_classical_classifiers.py
 │   ├── 11_dbscan_clustering.py
 │   ├── 12_outlier_analysis.py
+│   ├── 13_fairness_audit.py
+│   ├── 14_cross_hospital_generalization.py
+│   ├── 15_conformal_prediction.py
 │   ├── clustering_phenotypes.py
 │   ├── delong.py
 │   └── utility_score.py
 ├── outputs/
 │   ├── *.csv                    (metrics, cluster profiles, rule tables, OLAP demo tables,
 │   │                              classical_classifier_results.csv, dbscan_cluster_profiles.csv,
-│   │                              dbscan_manifest.csv, outlier_sepsis_lift.csv, outlier_iqr_bounds.csv)
+│   │                              dbscan_manifest.csv, outlier_sepsis_lift.csv, outlier_iqr_bounds.csv,
+│   │                              fairness_engineered_by_*.csv, fairness_engineered_gap_summary.csv,
+│   │                              cross_hospital_results.csv, conformal_prediction_summary.csv)
 │   ├── *.parquet                (out-of-fold predictions, for independent metric verification —
-│   │                              including one per classical classifier from script 10)
+│   │                              including one per classical classifier from script 10, cross-hospital
+│   │                              preds from script 14, and conformal predictions from script 15)
 │   ├── run*_log.txt             (stdout logs from each script run)
 │   ├── figures/                 (SHAP plots, dendrogram, silhouette plot, dbscan_kdistance_elbow.png,
-│   │                              outlier_sepsis_lift.png)
+│   │                              outlier_sepsis_lift.png, fairness_audit_engineered.png)
 │   └── powerbi_export/          (dim_patient.csv, dim_hospital.csv, fact_vitals_olap.csv)
 ├── warehouse/
 │   └── sepsis.duckdb            (gitignored — large binary, share via Google Drive)
+├── requirements.txt
 └── README.md
 ```
 
@@ -508,10 +626,21 @@ python src/09_hierarchical_clustering.py
 python src/10_classical_classifiers.py
 python src/11_dbscan_clustering.py
 python src/12_outlier_analysis.py
+python src/13_fairness_audit.py
+python src/14_cross_hospital_generalization.py
+python src/15_conformal_prediction.py
 ```
 
-Scripts 10–12 only depend on `02_feature_engineering.py` having already built `fact_features`/`fact_ffill` — they don't need scripts 03–09 to have run first, so they can be run any time after step 2 above if you just want to check them in isolation.
+Scripts 10–12 only depend on `02_feature_engineering.py` having already built `fact_features`/`fact_ffill` — they don't need scripts 03–09 to have run first, so they can be run any time after step 2 above if you just want to check them in isolation. Scripts 13–15 depend on `04_engineered_model.py`'s trained model/out-of-fold predictions, so run those after script 04.
 
 **Hardware note:** `04_engineered_model.py` is the most memory-intensive script (35 total XGBoost fits over the full feature set). On machines with <8GB RAM, make sure the float32-downcast fix (§4) is in place, or expect an OOM.
 
+**Dependency note:** `15_conformal_prediction.py` requires `mapie>=1.0`, which is not needed by any earlier script. Install with `pip install -r requirements.txt` (now includes `mapie>=1.0`) before running it — a fresh venv that only ran scripts 01–12 will hit `ModuleNotFoundError: No module named 'mapie'` on script 15.
+
 ---
+
+## 11. Pending work
+
+- Per-subgroup conformal coverage check (§9) — does the 90% guarantee hold uniformly across hospital/age subgroups, or is the "uncertain" flag itself unevenly distributed by site or age the way point-prediction AUROC is?
+- Hospital-specific recalibration or fine-tuning experiment, motivated directly by the §8/§14 cross-hospital generalization results.
+- Final report write-up consolidating §7's results summary and §8's fairness/generalization/uncertainty findings into the DWM/FE submission format.
