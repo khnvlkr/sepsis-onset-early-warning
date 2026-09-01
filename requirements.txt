@@ -10,3 +10,4 @@ scipy>=1.11
 pyarrow>=14.0
 tqdm
 ipykernel
+mapie>=1.0

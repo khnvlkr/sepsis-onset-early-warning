@@ -1,0 +1,2 @@
+confidence_level,n_test_rows,n_test_patients,empirical_coverage,pct_confident_no_sepsis,pct_confident_sepsis,pct_uncertain_both_labels,pct_empty_set,accuracy_confident_hours,accuracy_uncertain_hours,utility_full_cohort,utility_confident_only
+0.9,310653,8068,0.8974321831754402,0.7293958210607977,0.10505290468786717,0.1655512742513351,0.0,0.8770831404499584,0.5751813179334616,0.321654709918903,0.3870858049070585
