@@ -1,106 +1,154 @@
 # Early Warning System for Sepsis Onset Using Dynamic Physiological Telemetry
 
-A capstone project predicting sepsis onset **6 hours ahead** from hourly ICU vitals and labs, built on the real **PhysioNet/CinC Challenge 2019** dataset. Built for the "Data Warehouse and Mining" (DWM) and "Feature Engineering" (FE) subjects, B.Tech AI & Data Science, Sem V.
+An end-to-end data warehousing + machine learning pipeline that predicts **sepsis onset 6 hours ahead** from hourly ICU vitals and labs, built on the real **PhysioNet/Computing in Cardiology Challenge 2019** dataset. The project takes ~1.55 million patient-hours of raw ICU telemetry, turns them into a queryable data warehouse, engineers a 289-feature predictive representation of each patient-hour, trains and rigorously validates a gradient-boosted model against that target, and then stress-tests the result from every angle a clinical deployment would actually need answered: does it generalize across hospitals, is it fair across patient subgroups, does it know when it's uncertain, and what does it actually buy a nurse at the bedside compared to the rule-of-thumb screening already in use.
 
-> **Note on the title:** this is deliberately named *"...Sepsis Onset..."* and not the broader *"...Patient Deterioration..."* used in the original course proposal, because that is what `SepsisLabel` — the actual target variable — measures. Calling it "deterioration" would overstate what the model is trained on.
+> **On the title:** this is named *"...Sepsis Onset..."*, not the broader *"...Patient Deterioration..."*, because that is precisely what `SepsisLabel` — the target variable — measures. Calling it "deterioration" would overstate what the model is trained on.
 
 ---
 
 ## Table of contents
 
 1. [Dataset](#1-dataset)
-2. [Pipeline overview](#2-pipeline-overview)
-3. [Script-by-script walkthrough](#3-script-by-script-walkthrough)
-4. [Key engineering incident: the OOM crash](#4-key-engineering-incident-the-oom-crash)
+2. [Pipeline architecture](#2-pipeline-architecture)
+3. [Repository structure](#3-repository-structure)
+4. [Script-by-script walkthrough, with outputs](#4-script-by-script-walkthrough-with-outputs)
 5. [Leakage handling](#5-leakage-handling)
-6. [Syllabus gap analysis](#6-syllabus-gap-analysis-why-scripts-07-12-exist)
-7. [Results summary](#7-results-summary)
-8. [Fairness, generalization & uncertainty quantification](#8-fairness-generalization--uncertainty-quantification-why-scripts-13-15-exist)
-9. [Known limitations / honest caveats](#9-known-limitations--honest-caveats)
-10. [Repository structure & how to reproduce](#10-repository-structure--how-to-reproduce)
-11. [Pending work](#11-pending-work)
+6. [Results summary](#6-results-summary)
+7. [Limitations and honest caveats](#7-limitations-and-honest-caveats)
+8. [Reproducing this project](#8-reproducing-this-project)
 
 ---
 
 ## 1. Dataset
 
-The [PhysioNet/Computing in Cardiology Challenge 2019](https://physionet.org/content/challenge-2019/) dataset:
+The [PhysioNet/Computing in Cardiology Challenge 2019](https://physionet.org/content/challenge-2019/) dataset — real, de-identified ICU telemetry from two hospital systems.
 
 | | |
 |---|---|
 | Patients | 40,336 |
-| Patient-hours | 1,552,210 |
+| Patient-hours (rows in the fact table) | 1,552,210 |
 | Positive (septic) hour rate | 1.8% |
-| Raw features per hour | 40 vitals/labs + demographics (`HR`, `O2Sat`, `Temp`, `SBP`, `MAP`, `DBP`, `Resp`, `EtCO2`, `BaseExcess`, `HCO3`, `FiO2`, `pH`, `PaCO2`, `SaO2`, `AST`, `BUN`, `Alkalinephos`, `Calcium`, `Chloride`, `Creatinine`, `Bilirubin_direct`, `Glucose`, `Lactate`, `Magnesium`, `Phosphate`, `Potassium`, `Bilirubin_total`, `TroponinI`, `Hct`, `Hgb`, `PTT`, `WBC`, `Fibrinogen`, `Platelets`) |
-| Target | `SepsisLabel`, defined via Sepsis-3 criteria, shifted to represent "sepsis within the next 6h" |
-| Hospitals | 2 (`hospital_system_1`, `hospital_system_2`) |
+| Raw signals per hour | 8 vitals (`HR`, `O2Sat`, `Temp`, `SBP`, `MAP`, `DBP`, `Resp`, `EtCO2`) + 26 labs (`BaseExcess`, `HCO3`, `FiO2`, `pH`, `PaCO2`, `SaO2`, `AST`, `BUN`, `Alkalinephos`, `Calcium`, `Chloride`, `Creatinine`, `Bilirubin_direct`, `Glucose`, `Lactate`, `Magnesium`, `Phosphate`, `Potassium`, `Bilirubin_total`, `TroponinI`, `Hct`, `Hgb`, `PTT`, `WBC`, `Fibrinogen`, `Platelets`) + demographics (`Age`, `Gender`, `HospAdmTime`, `ICULOS`) |
+| Target | `SepsisLabel` — derived from Sepsis-3 criteria by the Challenge organizers, defined to flip to 1 six hours before clinically documented onset, so a positive at hour *t* already means "sepsis within the next 6 hours" |
+| Hospitals | 2 (`hospital_system_1`: 20,336 patients, `hospital_system_2`: 20,000 patients) |
 
-This is a genuinely hard, severely imbalanced clinical prediction task — 1.8% positive rate means a model that always predicts "no sepsis" is already 98.2% accurate, which is exactly why AUROC/AUPRC, not accuracy, are used to judge it throughout this project.
+This is a genuinely hard, severely imbalanced clinical prediction problem. A 1.8% positive rate means a model that always predicts "no sepsis" is already 98.2% "accurate" — which is exactly why this project scores everything on **AUROC**, **AUPRC**, and a **clinical utility score** (§4, `utility_score.py`) instead of accuracy throughout.
 
----
-
-## 2. Pipeline overview
-
-Scripts live in `src/` and are numbered in execution order:
-
-```
-01_etl_warehouse.py           raw .psv  ->  DuckDB star schema
-02_feature_engineering.py     star schema  ->  294-column engineered feature table
-03_baseline_model.py          XGBoost on 15 raw features (control)
-04_engineered_model.py        XGBoost on full engineered feature set + DeLong test + ablation
-05_explainability.py          SHAP analysis on the engineered model
-06_leadtime_alarm_fatigue.py  clinical framing: lead time, sensitivity, false-alarm rate
-07_olap_and_export.py         OLAP demo (roll-up/drill-down/slice/dice) + Power BI export
-08_association_rules.py       Apriori / association rule mining on binned abnormal-flags
-09_hierarchical_clustering.py Ward-linkage hierarchical clustering (phenotype discovery)
-10_classical_classifiers.py   Decision Tree + Naive Bayes classifiers (raw vs engineered features)
-11_dbscan_clustering.py       DBSCAN density-based clustering (phenotype discovery, 3rd method)
-12_outlier_analysis.py        IQR fencing + Isolation Forest outlier detection vs SepsisLabel
-13_fairness_audit.py          subgroup AUROC/AUPRC/utility audit across age, gender, hospital
-14_cross_hospital_generalization.py  train-on-one-hospital / test-on-the-other generalization test
-15_conformal_prediction.py    MAPIE split-conformal classification with 90% coverage guarantee
-clustering_phenotypes.py      k-means clustering (phenotype discovery)
-delong.py                     DeLong's test helper (statistical comparison of two AUCs)
-utility_score.py              PhysioNet Challenge 2019's official clinical utility metric
-```
-
-Everything downstream of `01_etl_warehouse.py` reads from the DuckDB warehouse, not the raw `.psv` files — this keeps every later step fast and lets DuckDB's vectorized SQL engine do the heavy lifting (window functions, aggregations) instead of pandas.
+Most cells in the raw lab columns are `NULL` in any given hour, because labs are drawn on clinical judgment, not on a fixed hourly schedule — vitals like `HR`/`Temp`/`Resp` are much more densely sampled than labs like `Lactate` or `Bilirubin_total`. This sparsity is not cleaned away; it is treated as a feature in its own right (§4, `02_feature_engineering.py`).
 
 ---
 
-## 3. Script-by-script walkthrough
+## 2. Pipeline architecture
 
-### `01_etl_warehouse.py` — raw files to star schema
+```
+raw PhysioNet .psv files (one per patient)
+        │
+        ▼
+01_etl_warehouse.py            →  DuckDB star schema (dim_patient, dim_hospital, fact_vitals_hourly)
+        │
+        ▼
+02_feature_engineering.py      →  fact_features: 294-column engineered table (SQL window functions)
+        │
+        ├──► 03_baseline_model.py        →  XGBoost, 15 raw features            (control)
+        │
+        ├──► 04_engineered_model.py      →  XGBoost, 289 engineered features     (main model)
+        │           │
+        │           ├──► 05_explainability.py           SHAP attribution
+        │           ├──► 06_leadtime_alarm_fatigue.py    lead time / false-alarm framing
+        │           ├──► 13_fairness_audit.py            subgroup performance audit
+        │           ├──► 14_cross_hospital_generalization.py   train-one/test-other hospital
+        │           └──► 15_conformal_prediction.py      calibrated uncertainty sets
+        │
+        ├──► 07_olap_and_export.py       →  OLAP cube demo + Power BI CSV export
+        ├──► 08_association_rules.py     →  Apriori rule mining on abnormal-vital flags
+        ├──► clustering_phenotypes.py    →  k-means phenotype search
+        ├──► 09_hierarchical_clustering.py →  Ward-linkage phenotype search
+        ├──► 11_dbscan_clustering.py     →  density-based phenotype search
+        ├──► 10_classical_classifiers.py →  Decision Tree + Naive Bayes, raw vs. engineered
+        └──► 12_outlier_analysis.py      →  IQR fencing + Isolation Forest vs. SepsisLabel
 
-**What it does:** parses the raw PhysioNet `.psv` (pipe-separated) files, one per patient, and loads them into a DuckDB warehouse using a classic **star schema**:
+delong.py         (shared) statistical test for comparing two correlated AUROCs
+utility_score.py  (shared) PhysioNet Challenge's own clinical utility metric
+```
 
-- `dim_patient` — one row per patient (age, gender, hospital, admission time, ICU length of stay, ever-septic flag)
-- `dim_hospital` — one row per hospital system
-- `fact_vitals_hourly` — one row per **patient-hour** (the grain of the whole project), with 33 raw vitals/labs columns, `ICULOS`, and `SepsisLabel`
+Everything downstream of `01_etl_warehouse.py` reads from the DuckDB warehouse, never the raw `.psv` files directly — this keeps every later step fast and lets DuckDB's vectorized SQL engine (window functions, joins, aggregations) do the heavy lifting instead of row-by-row pandas code.
 
-**Why a star schema:** this is the DWM syllabus requirement — dimensional modeling with clearly separated fact and dimension tables — and it also happens to be the right structure for this data: vitals are naturally a fact table (one measurement event per patient per hour) with patient and hospital as dimensions you'd want to slice by.
+---
+
+## 3. Repository structure
+
+```
+sepsis_capstone/
+├── src/
+│   ├── 01_etl_warehouse.py                    raw .psv -> DuckDB star schema
+│   ├── 02_feature_engineering.py              star schema -> 294-column feature table
+│   ├── 03_baseline_model.py                   XGBoost control model (15 raw features)
+│   ├── 04_engineered_model.py                 XGBoost main model + DeLong test + ablation
+│   ├── 05_explainability.py                   SHAP analysis
+│   ├── 06_leadtime_alarm_fatigue.py           lead time + false-alarm-rate analysis
+│   ├── 07_olap_and_export.py                  OLAP demo (roll-up/drill-down/slice/dice) + Power BI export
+│   ├── 08_association_rules.py                Apriori association rule mining
+│   ├── 09_hierarchical_clustering.py          Ward-linkage hierarchical clustering
+│   ├── 10_classical_classifiers.py            Decision Tree + Naive Bayes (raw vs. engineered)
+│   ├── 11_dbscan_clustering.py                DBSCAN density-based clustering
+│   ├── 12_outlier_analysis.py                 IQR + Isolation Forest outlier detection
+│   ├── 13_fairness_audit.py                   subgroup AUROC/AUPRC/utility audit
+│   ├── 14_cross_hospital_generalization.py    train-on-one/test-on-other hospital
+│   ├── 15_conformal_prediction.py             MAPIE split-conformal uncertainty sets
+│   ├── clustering_phenotypes.py               k-means clustering
+│   ├── delong.py                              DeLong's test (AUROC comparison)
+│   └── utility_score.py                       PhysioNet Challenge 2019 utility metric
+├── outputs/
+│   ├── *.csv               metrics, cluster profiles, rule tables, OLAP demo tables, fairness/
+│   │                        cross-hospital/conformal summaries
+│   ├── *.parquet           out-of-fold predictions for every model, for independent
+│   │                        metric verification without re-training
+│   ├── run*_log.txt        captured stdout from each script run
+│   ├── figures/            SHAP plots, dendrogram, silhouette plot, DBSCAN elbow,
+│   │                        outlier-lift chart, fairness-audit chart
+│   └── powerbi_export/     dim_patient.csv, dim_hospital.csv, fact_vitals_olap.csv
+├── warehouse/
+│   └── sepsis.duckdb       (gitignored — rebuilt locally by 01_etl_warehouse.py)
+├── requirements.txt
+├── POWERBI_HANDOFF.md      standalone instructions for the Power BI half of the OLAP demo
+└── README.md
+```
+
+---
+
+## 4. Script-by-script walkthrough, with outputs
+
+### `01_etl_warehouse.py` — raw files → star schema
+
+Parses the raw PhysioNet `.psv` (pipe-separated) files — one file per patient — and loads them into a DuckDB warehouse using a **star schema**:
+
+- **`dim_patient`** — one row per patient: age, gender, hospital, hospital-admission offset, max ICU length-of-stay, an "ever septic" flag, and hours-recorded count.
+- **`dim_hospital`** — one row per hospital system.
+- **`fact_vitals_hourly`** — the fact table, grain = one row per **patient-hour**: the 8 vitals + 26 labs, `ICULOS` (ICU length of stay in hours), and `SepsisLabel`.
+
+Each subfolder under the raw-data directory is treated as one "hospital system," which is how `hospital_id` gets assigned. A composite index on `(patient_id, hour)` is built on the fact table specifically to make the window-function pass in the next script fast.
+
+This isn't dimensional modeling for its own sake — vitals genuinely are a fact table (one measurement event per patient per hour), with patient and hospital as the natural dimensions to slice and roll up by, which is exactly the structure `07_olap_and_export.py` and the Power BI export later depend on.
 
 ### `02_feature_engineering.py` — SQL window-function features
 
-**What it does:** runs SQL window-function queries directly in DuckDB (not pandas) to turn the 33 raw columns into **294 engineered columns**. Four feature families:
+Runs SQL window-function queries directly inside DuckDB (deliberately not pandas, for both speed and correctness) to turn the raw columns into **294 engineered columns**, in four families:
 
 | Family | Count | Logic |
 |---|---|---|
-| `raw_ffill` | 15 | Forward-filled snapshot of the most recent reading per vital (labs aren't drawn every hour, so most cells in the raw table are `NULL`) |
-| `rolling_stats` | 180 | Causal rolling mean / std / min / max / slope over **3h / 6h / 12h windows**, per vital |
-| `slopes_velocity` | 60 | Rate-of-change features — is a vital moving in a dangerous direction, not just where it currently sits |
-| `missingness` | 30 | `hours_since_last_<vital>` — how long since this vital was last measured |
-| `clinical_ratios` | 4 | Domain-knowledge features: shock index (HR/SBP), pulse pressure (SBP−DBP), partial SIRS score, partial qSOFA score |
+| `raw_ffill` | 15 | Forward-filled snapshot of the most recent reading per vital/lab (labs aren't drawn every hour, so most raw cells are `NULL`) |
+| `rolling_stats` | 180 | Causal rolling **mean / std / min / max / slope** over **3h / 6h / 12h** windows, per vital, computed on the forward-filled series |
+| `slopes_velocity` | 60 | First-difference "velocity" features — is a vital currently moving, and in which direction, not just where it sits |
+| `missingness` | 30 | `X_missing` (is this vital `NULL` right now) and `hours_since_last_X` (how long since it was last measured) |
+| `clinical_ratios` | 4 | Shock index (`HR/SBP`), pulse pressure (`SBP−DBP`), a partial SIRS score, a partial qSOFA score |
 
-**Why "causal" windows matter:** every rolling/window feature only looks **backward** in time from the current hour — `AVG(HR) OVER (PARTITION BY patient_id ORDER BY hour ROWS BETWEEN 11 PRECEDING AND CURRENT ROW)` style logic, never `FOLLOWING`. This is the single most important anti-leakage decision in the whole project (see [§5](#5-leakage-handling)) — a model that could see future vitals would trivially "predict" sepsis it had already been told about.
+**Why the windows are causal:** every rolling/window feature only looks **backward** — `ROWS BETWEEN N PRECEDING AND CURRENT ROW`, never `FOLLOWING`. A feature computed with `AVG(HR) OVER (... ROWS BETWEEN 11 PRECEDING AND CURRENT ROW)` at hour *t* only ever sees hours ≤ *t*. This is the single most load-bearing anti-leakage decision in the pipeline (§5) — a model that could see future vitals would trivially "predict" sepsis it had already been shown.
 
-**Why missingness-as-signal:** in ICU data, a lab *not* being drawn is itself informative — clinicians order more frequent labs (e.g., lactate) when they're worried about a patient. So `hours_since_last_Lactate` is a real predictive signal, not just an artifact of sparse data — and this is empirically confirmed later in the SHAP results (§3, `05_explainability.py`), where `Lactate_hours_since_last` and `Bilirubin_total_hours_since_last` rank in the top 6 most important features model-wide.
+**Why missingness is treated as signal, not noise:** clinicians order labs like lactate *more* frequently when they're worried about a patient, so `hours_since_last_Lactate` genuinely encodes clinical suspicion, not just data sparsity. This is confirmed empirically later — `Lactate_hours_since_last` and `Bilirubin_total_hours_since_last` rank 3rd and 6th by SHAP importance model-wide (§4, `05_explainability.py`).
 
-### `03_baseline_model.py` — the control group
+### `03_baseline_model.py` — the control model
 
-**What it does:** trains XGBoost on **only the 15 raw forward-filled features** (no rolling stats, no engineered ratios), using `GroupKFold(5)` split **by patient** (not by row) — critical, since splitting by row would let hours from the same patient leak across train/test.
-
-**Result:**
+Trains XGBoost on **only the 15 raw forward-filled features** — no rolling stats, no engineered ratios — using `GroupKFold(5)` split **by `patient_id`**, not by row (splitting by row would let different hours from the same patient leak across train and test). This exists purely as a control: it establishes what performance the *raw signal alone* buys, so the lift from feature engineering in the next script can be measured against something concrete rather than a vague intuition.
 
 | Metric | Value |
 |---|---|
@@ -110,41 +158,36 @@ Everything downstream of `01_etl_warehouse.py` reads from the DuckDB warehouse, 
 | Best threshold | 0.541 |
 | Features | 15 |
 
-This exists purely as a control — it answers "how much does the feature engineering actually buy us?" in §3 (`04_engineered_model.py`) below.
+### `04_engineered_model.py` — the main model, with statistical proof it's actually better
 
-### `04_engineered_model.py` — the full model, with statistical proof it's actually better
+Trains XGBoost on the full engineered set (289 of the 294 columns from script 02 are used as inputs; the rest are identifiers/labels), same patient-grouped `GroupKFold(5)` split, then runs two further analyses on top of the main fit:
 
-**What it does:** trains XGBoost on the full 289-feature engineered set (of the 294 columns produced in script 02, 289 are used as model inputs — the rest are identifiers/labels not meant to be features), same `GroupKFold(5)` patient-level split, then runs two extra analyses:
+1. **DeLong's test** (`delong.py`) — the statistically correct way to check whether two AUROCs computed on the *same* patients are actually different, versus just numerically different by sampling noise.
+2. **Feature-family ablation** — retrain using only one feature family at a time (plus demographics), to see which family is actually carrying the predictive lift.
 
-1. **DeLong's test** — a statistical test specifically designed to tell whether two AUROCs, computed on the *same* patients, are significantly different (not just "one number is bigger than the other by chance").
-2. **Feature-family ablation** — retrain the model using *only* one feature family at a time (plus demographics), to see which family is actually carrying the predictive lift.
-
-**Result:**
-
-| Metric | Baseline | Engineered |
+| Metric | Baseline (15 features) | Engineered (289 features) |
 |---|---|---|
 | AUROC | 0.7572 | **0.7918** |
 | AUPRC | 0.0634 | **0.0821** |
 | Normalized utility | 0.2504 | **0.3203** |
-| Features | 15 | 289 |
 
-**DeLong's test:** z = **−38.30**, p ≈ **0.0** — the AUROC improvement is not noise; it's about as statistically decisive as this kind of test gets on 1.55M paired hourly predictions.
+**DeLong's test:** z = **−38.30**, p ≈ **0.0** — on 1.55M paired hourly predictions, this is about as statistically decisive a result as this test produces. The AUROC gain is not noise.
 
-**Ablation — which feature family actually matters:**
+**Ablation — which feature family actually carries the lift:**
 
 | Feature family | # features | AUROC | AUPRC |
 |---|---|---|---|
-| **rolling_stats** | 180 | **0.7737** | 0.0695 |
-| raw_ffill (= baseline) | 15 | 0.7572 | 0.0634 |
-| slopes_velocity | 60 | 0.7228 | 0.0557 |
-| missingness | 30 | 0.7163 | 0.0618 |
-| clinical_ratios | 4 | 0.6561 | 0.0379 |
+| **`rolling_stats`** | 180 | **0.7737** | 0.0695 |
+| `raw_ffill` (= baseline) | 15 | 0.7572 | 0.0634 |
+| `slopes_velocity` | 60 | 0.7228 | 0.0557 |
+| `missingness` | 30 | 0.7163 | 0.0618 |
+| `clinical_ratios` | 4 | 0.6561 | 0.0379 |
 
-**The headline finding:** `rolling_stats` *alone* (180 features) gets to AUROC 0.7737 — over 80% of the total lift from baseline (0.7572) to full model (0.7918) — while the hand-crafted `clinical_ratios` (shock index, SIRS/qSOFA) actually score *below* the raw baseline in isolation. The lesson: broad, mechanical rolling-window statistics beat narrow, textbook clinical-scoring features here — the model doesn't need domain-knowledge shortcuts if it has enough raw trend information to reconstruct them itself.
+`rolling_stats` *alone* reaches AUROC 0.7737 — over 80% of the total lift from baseline (0.7572) to full model (0.7918) — while the hand-crafted `clinical_ratios` (shock index, SIRS/qSOFA) actually score *below* the raw baseline in isolation. Broad, mechanical rolling-window statistics beat narrow, textbook clinical-scoring features here: the model doesn't need hand-built domain shortcuts if it has enough raw trend information to reconstruct the equivalent signal itself.
 
 ### `05_explainability.py` — SHAP analysis
 
-**What it does:** computes SHAP (SHapley Additive exPlanations) values for the engineered model — a game-theoretic way of attributing each prediction to individual features, rather than trusting XGBoost's built-in (and less reliable) feature importance.
+Computes SHAP (SHapley Additive exPlanations) values for the engineered model — attributing each individual prediction to specific input features via a game-theoretic decomposition, rather than trusting XGBoost's built-in (coarser, less reliable) importance scores.
 
 **Top 15 features by mean |SHAP|:**
 
@@ -168,20 +211,34 @@ This exists purely as a control — it answers "how much does the feature engine
 
 ![SHAP summary plot](outputs/figures/shap_summary.png)
 
-**Clinical sense-check:** this ranking is not surprising to anyone who knows Sepsis-3 criteria — **lactate** (a marker of tissue hypoperfusion) dominates, closely followed by the **partial SIRS score** (the classic bedside sepsis screening heuristic) and **temperature/respiratory** trend features (fever and tachypnea are core SIRS criteria). The fact that a black-box gradient-boosted model, given nothing but raw window statistics, independently rediscovers that lactate and SIRS-adjacent signals matter most is a good sanity check that the model has learned something clinically real, not spurious correlations.
+*Every dot is one patient-hour; horizontal position is that feature's push toward ("sepsis," right) or away from ("no sepsis," left) the prediction, and color is the feature's own value (red = high, blue = low).*
 
-**A more surprising finding:** two *missingness* features (`Lactate_hours_since_last`, rank 3; `Bilirubin_total_hours_since_last`, rank 6) rank higher than most raw vital-sign features. This validates the missingness-as-signal design decision from script 02 — the model is picking up on clinician behavior (ordering more frequent labs when worried) as a genuinely useful, if indirect, predictive signal.
+**Clinical sense-check:** none of this is surprising to anyone familiar with Sepsis-3 criteria. **Lactate** — a marker of tissue hypoperfusion — dominates, closely followed by the **partial SIRS score** (the classic bedside sepsis screening heuristic) and **temperature/respiratory** trend features (fever and tachypnea are core SIRS criteria). A gradient-boosted model, given nothing but raw rolling-window statistics and no hand-coded medical knowledge beyond the four clinical-ratio features, independently rediscovers that lactate and SIRS-adjacent signals matter most — that's a meaningful sanity check that it has learned something clinically real rather than a spurious correlation.
+
+The dependence plots below make two of the top relationships concrete:
+
+![SHAP dependence: partial SIRS score](outputs/figures/shap_dependence_partial_sirs_score.png)
+
+*Each additional SIRS criterion met pushes the prediction up in a clear step pattern — 0 criteria pulls the prediction down, 2+ pushes it up, with diminishing separation past 2, consistent with the standard clinical convention of using "≥2 criteria" as the SIRS-positive threshold rather than treating the count as linearly informative.*
+
+![SHAP dependence: shock index](outputs/figures/shap_dependence_shock_index.png)
+
+*Shock index (heart rate ÷ systolic blood pressure) shows a fairly monotonic relationship with SHAP value — as HR climbs relative to SBP (a classic sign of compensated shock), the model's push toward "sepsis" increases smoothly rather than jumping at one cutoff.*
+
+A more surprising finding: two *missingness* features — `Lactate_hours_since_last` (rank 3) and `Bilirubin_total_hours_since_last` (rank 6) — outrank most raw vital-sign features. This validates the missingness-as-signal design decision from script 02: the model is picking up on clinician ordering behavior (more frequent labs when a clinician is worried) as a genuinely useful, if indirect, predictive signal.
+
+Here is what that attribution looks like for one individual, correctly-flagged positive case:
+
+![SHAP waterfall, positive case](outputs/figures/shap_waterfall_case_positive.png)
+
+*Starting from the model's average output (0.029), this patient-hour's elevated temperature (`Temp_ffill`, `Temp_max_6h`, `Temp_max_3h`), elevated lactate (`Lactate_max_12h`), abnormal bilirubin, and a partial SIRS score of 2 stack up to push the final prediction to 2.578 (in log-odds space) — a clear, individually-inspectable justification for the alert, not a black-box number.*
 
 ### `06_leadtime_alarm_fatigue.py` — translating AUROC into something a clinician cares about
 
-**What it does:** AUROC/AUPRC are abstract to a bedside clinician. This script reframes the model in terms that matter operationally: *how early does it warn, and how many false alarms does a nurse have to tolerate per true warning?*
+AUROC and AUPRC are abstract at the bedside. This script reframes the model in operational terms: *how early does it warn, and how many false alarms does a nurse have to tolerate per true warning?* Two things are computed at the model's best-utility operating threshold (0.500):
 
-Two things are computed at the model's best-utility operating threshold (0.500):
-
-1. **Lead time distribution** — for every septic patient who got at least one alert before/at their actual sepsis onset, how many hours of advance warning did they get?
-2. **Alarm-fatigue comparison** — the engineered model vs. the naive rule-based baseline every ICU already uses (**SIRS ≥ 2**, i.e., "raise an alert if the patient meets at least 2 of the 4 SIRS criteria"), matched to the *same sensitivity* so the comparison is fair.
-
-**Result:**
+1. **Lead time distribution** — for every septic patient who received at least one alert before/at their actual sepsis onset, how many hours of advance warning did they get?
+2. **Alarm-fatigue comparison** — the engineered model vs. the naive rule-based screen every ICU already has available (**SIRS ≥ 2**, i.e., flag when a patient meets at least 2 of the 4 SIRS criteria), matched to the *same sensitivity* so the comparison isn't rigged by picking favorable operating points.
 
 | | |
 |---|---|
@@ -198,23 +255,23 @@ Two things are computed at the model's best-utility operating threshold (0.500):
 | Engineered model (matched) | 0.5072 | **0.1268** |
 | Engineered model (default 0.5 threshold) | 0.5998 | 0.1796 |
 
-**Why this matters:** at *matched* sensitivity (~50.7% either way), the engineered model cuts the false-alarm rate roughly **in half** (0.127 vs 0.289) relative to the SIRS≥2 rule every ICU already runs. That's the practically meaningful headline of this entire project — not the AUROC number itself, but "for the same number of patients caught, nurses get half as many false pages."
+At matched sensitivity (~50.7% either way), the engineered model cuts the false-alarm rate roughly **in half** (0.127 vs. 0.289) relative to the SIRS≥2 screen every ICU already runs. This — not the raw AUROC number — is the practically meaningful headline of the whole project: for the same number of true cases caught, a nurse would get roughly half as many false pages.
 
 ### `07_olap_and_export.py` — OLAP demonstration + Power BI export
 
-**What it does:** two things bolted onto this script, added specifically to cover a DWM syllabus gap (see [§6](#6-syllabus-gap-analysis-why-scripts-07-09-exist)):
+Two things happen here: the four classic OLAP cube operations are demonstrated directly against the warehouse in SQL, and the same star schema is exported to CSV so it can be rebuilt interactively in Power BI (full walkthrough in `POWERBI_HANDOFF.md`).
 
-**(a) OLAP cube operations, demonstrated directly in DuckDB SQL:**
+**OLAP operations, in DuckDB SQL:**
 
 | Operation | What it means here | Result |
 |---|---|---|
 | **Roll-up** (hourly → daily) | Aggregate `fact_vitals_hourly` up to one row per patient per day | 105,665 rows |
 | **Roll-up** (daily → whole stay) | Aggregate further to one row per patient's entire ICU stay | 40,336 rows |
-| **Drill-down** (hospital → patient → hour) | Start at hospital-level averages, drill into a single patient, then into their hour-by-hour detail | Hospital 1: avg HR 84.89 (20,336 patients); Hospital 2: avg HR 83.83 (20,000 patients) |
+| **Drill-down** (hospital → patient → hour) | Start at hospital-level averages, descend into a single patient, then that patient's hour-by-hour detail | Hospital 1: avg HR 84.89 (20,336 patients); Hospital 2: avg HR 83.83 (20,000 patients) |
 | **Slice** (`SepsisLabel = 1` only) | Cut the cube down to only septic patient-hours | 27,916 rows |
-| **Dice** (hospital=1 AND septic AND Lactate>2.0) | Filter on multiple dimensions simultaneously | 2,438 rows |
+| **Dice** (hospital 1 AND septic AND `Lactate > 2.0`) | Filter on multiple dimensions simultaneously | 2,438 rows |
 
-**(b) Power BI export** — writes three CSVs to `outputs/powerbi_export/` for the star schema to be rebuilt as an actual Power BI model (per the professor's specific requirement that the schema be demonstrated in Power BI, not just SQL):
+**Power BI export** — three CSVs written to `outputs/powerbi_export/`, so the same roll-up/drill-down/slice/dice operations can be rebuilt as interactive Power BI visuals rather than only existing as one-off SQL queries:
 
 | File | Rows | Purpose |
 |---|---|---|
@@ -222,25 +279,25 @@ Two things are computed at the model's best-utility operating threshold (0.500):
 | `dim_hospital.csv` | 2 | Hospital dimension |
 | `fact_vitals_olap.csv` | 1,552,210 × 15 cols | Fact table, ready for `Get Data → Text/CSV` import |
 
-The intended Power BI workflow (documented in the script's own log output): import all three CSVs, connect `patient_id`/`hospital_id` as relationships in Model view, then build a Matrix visual with a `hospital → day_bucket → hour` row hierarchy (demonstrates roll-up/drill-down interactively) and slicers on `hospital_id`/`SepsisLabel` (demonstrates slice/dice).
+The intended Power BI workflow (detailed in `POWERBI_HANDOFF.md`): import all three CSVs, connect `patient_id`/`hospital_id` as relationships in Model view, build a Matrix visual with a `hospital → day_bucket → hour` row hierarchy (roll-up/drill-down, interactively), and add slicers on `hospital_id`/`SepsisLabel` (slice/dice).
 
-### `08_association_rules.py` — Apriori / market-basket analysis on clinical flags
+### `08_association_rules.py` — association rule mining on clinical flags
 
-**What it does:** bins six vitals into binary abnormal-flags (`HR_high`, `Temp_abnormal`, `Resp_high`, `SBP_low`, `WBC_abnormal`, `Lactate_high`) and runs the **Apriori algorithm** to mine association rules — the same technique used for retail "customers who bought X also bought Y" analysis, applied here to "patient-hours with flag X also tend to have flag Y (and Sepsis)."
+Continuous vitals aren't natural input for Apriori, so this bins six vitals into binary abnormal/normal flags using standard clinical cutoffs (the same spirit as SIRS/qSOFA), then mines which **combinations** of abnormal flags co-occur and how strongly each combination associates with `SepsisLabel = 1` — the same technique retail analytics uses for "customers who bought X also bought Y," applied here to "patient-hours with flag X also tend to have flag Y (and sepsis)."
 
 **Flag prevalence in the data:**
 
-| Flag | Prevalence |
-|---|---|
-| `HR_high` | 33.0% |
-| `WBC_abnormal` | 29.5% |
-| `Resp_high` | 28.9% |
-| `SBP_low` | 13.5% |
-| `Temp_abnormal` | 12.1% |
-| `Lactate_high` | 9.1% |
-| `Sepsis` | 1.8% |
+| Flag | Threshold | Prevalence |
+|---|---|---|
+| `HR_high` | HR > 90 | 33.0% |
+| `WBC_abnormal` | WBC > 12 or < 4 | 29.5% |
+| `Resp_high` | Resp > 20 | 28.9% |
+| `SBP_low` | SBP < 100 | 13.5% |
+| `Temp_abnormal` | Temp > 38 or < 36 | 12.1% |
+| `Lactate_high` | Lactate > 2.0 | 9.1% |
+| `Sepsis` | `SepsisLabel = 1` | 1.8% |
 
-374 total rules were found; 28 have `Sepsis` as a consequent; 9 of those are **compound** (2+ antecedent flags).
+374 total rules were found; 28 have `Sepsis` as a consequent; 9 of those are compound (2+ antecedent flags).
 
 **Top rules by lift, antecedent → Sepsis:**
 
@@ -255,13 +312,15 @@ The intended Power BI workflow (documented in the script's own log output): impo
 | `{Temp_abnormal}` (best single-flag) | **1.99** | 3.59% |
 | `{Lactate_high}` | 1.69 | 3.04% |
 
-**The finding:** the best 2-flag compound rule (`{Resp_high, Temp_abnormal}`, lift 2.83) beats the best single-flag rule (`Temp_abnormal` alone, lift 1.99) by about **42%**. This is a nice, empirically-derived validation of *why* SIRS/qSOFA-style scoring — which requires multiple simultaneous abnormal signs, not just one — outperforms single-symptom screening in practice. It's independent evidence for the same conclusion the SHAP analysis reached (`partial_sirs_score` ranking #2 overall).
+The best 2-flag compound rule (`{Resp_high, Temp_abnormal}`, lift 2.83) beats the best single-flag rule (`Temp_abnormal` alone, lift 1.99) by about **42%**. This is an independent, empirically-derived confirmation of *why* SIRS/qSOFA-style multi-criteria scoring outperforms single-symptom screening: it reaches the same conclusion the SHAP ranking reached (`partial_sirs_score` at rank #2), from a completely different, model-free technique.
 
 ### `09_hierarchical_clustering.py` + `clustering_phenotypes.py` — sepsis phenotype discovery
 
-**What it does:** attempts to answer "are there distinct clinical *subtypes* of septic patients?" (e.g., a hyperinflammatory phenotype vs. a hypotensive phenotype) using two different clustering algorithms on per-patient trajectory summaries (mean/std/min/max of each vital over the whole stay) — required because the DWM syllabus specifically names both partition-based (k-means) and hierarchical clustering as separate graded lab experiments.
+Two clustering algorithms attempt to answer "are there distinct clinical *subtypes* of septic patients?" (e.g. a hyperinflammatory phenotype vs. a hypotensive phenotype), applied to per-patient whole-stay trajectory summaries (mean/std/min/max of each vital across the entire ICU stay, not individual hours).
 
-**k-means** (`clustering_phenotypes.py`) — tested k=2 through k=7 by silhouette score:
+**k-means** (`clustering_phenotypes.py`), silhouette-scored across k=2 to k=7:
+
+![k-means silhouette by k](outputs/figures/cluster_silhouette.png)
 
 | k | Silhouette |
 |---|---|
@@ -272,9 +331,9 @@ The intended Power BI workflow (documented in the script's own log output): impo
 | 6 | 0.087 |
 | 7 | 0.089 |
 
-At k=2, on the full complete-case population (31,857 patients): cluster 0 (19,736 patients, 7.47% sepsis rate) vs cluster 1 (12,729 patients, 7.01% sepsis rate).
+At k=2, on the full complete-case population (31,857 patients): cluster 0 (19,736 patients, 7.47% sepsis rate) vs. cluster 1 (12,729 patients, 7.01% sepsis rate).
 
-**Hierarchical, Ward linkage** (`09_hierarchical_clustering.py`) — Ward-linkage clustering requires an O(n²) pairwise distance matrix, which isn't tractable on the full population on the development laptop (7.4GB RAM — the same machine that OOM-crashed on script 04, see [§4](#4-key-engineering-incident-the-oom-crash)). This is run on a **stratified random subsample of 8,000 patients** (seed=42, stratified on sepsis outcome — verified to preserve the 7.11% sepsis rate exactly in both the full population and the subsample). For a fair comparison, k-means was also re-run on this identical 8,000-patient subsample:
+**Hierarchical clustering, Ward linkage** (`09_hierarchical_clustering.py`) — Ward-linkage clustering needs a full O(n²) pairwise distance matrix, which is only tractable on a subsample, not the full 31,857-patient population, so this runs on a **stratified random subsample of 8,000 patients** (seed=42, stratified on sepsis outcome — the 7.11% sepsis rate is preserved exactly between the full population and the subsample). For a fair comparison, k-means was re-run on the identical 8,000-patient subsample:
 
 | Method | N | Silhouette |
 |---|---|---|
@@ -282,19 +341,15 @@ At k=2, on the full complete-case population (31,857 patients): cluster 0 (19,73
 | k-means (k=2), same subsample | 8,000 | 0.157 |
 | k-means (k=2), full population | 31,857 | 0.160 |
 
-At k=2, hierarchical cluster 1 (3,245 patients, 7.67% sepsis rate) vs cluster 2 (4,755 patients, 6.73% sepsis rate).
+At k=2, hierarchical cluster 1 (3,245 patients, 7.67% sepsis rate) vs. cluster 2 (4,755 patients, 6.73% sepsis rate).
 
 ![Hierarchical dendrogram](outputs/figures/hierarchical_dendrogram.png)
 
-**The finding — reported honestly as a null result, not hidden:** both clustering methods agree there is **no clinically meaningful sepsis phenotype** in this feature space. Silhouette scores are low across the board (0.10–0.16, well below the ~0.5+ that would indicate genuinely separable clusters), and — more importantly — the sepsis rate is nearly flat across every cluster either method produces (differences of only 0.5–1 percentage points). Whatever these clusters are picking up on (probably coarse things like hospital/ward assignment or general illness severity), it isn't sepsis subtype. That the two independent methods, run on different sample sizes and different linkage logic, converge on the *same* negative conclusion is itself a reasonably strong piece of evidence that this negative result is real rather than a modeling artifact.
+**Reported honestly as a null result:** both methods agree there is **no clinically meaningful sepsis phenotype** in this feature space. Silhouette scores are low across the board (0.095–0.160, well below the ~0.5+ that would indicate genuinely separable clusters), and — more importantly — the sepsis rate is nearly flat across every cluster either method produces (differences of only 0.5–1 percentage points). Whatever these clusters are picking up on (plausibly coarse things like general illness severity or ward assignment), it isn't sepsis subtype. Two independent methods, different sample sizes, different linkage logic, converging on the same negative conclusion is itself a reasonably strong piece of evidence that this null result is real rather than a modeling artifact — it's reported as-is rather than tuned to manufacture a more "interesting" outcome.
 
 ### `10_classical_classifiers.py` — Decision Tree & Naive Bayes
 
-**What it does:** the DWM Module 6 syllabus names **Decision Tree Induction** and **Bayesian Classification** as classification techniques distinct from the boosted-tree XGBoost model used everywhere else in this project (§3, scripts 03/04). This script closes that gap by training `sklearn.tree.DecisionTreeClassifier` and `sklearn.naive_bayes.GaussianNB` on the same warehouse tables, same patient-grouped `GroupKFold(5)` split, and same AUROC/AUPRC/normalized-utility metrics as the baseline and engineered models — so the numbers sit directly next to the rest of the results table rather than existing in isolation.
-
-Each classifier is run twice: once on the 15 raw forward-filled features (control, matches `03_baseline_model.py`'s feature set) and once on the full 289-column engineered set (matches `04_engineered_model.py`'s). Neither model handles `NaN`s natively the way XGBoost does, so a per-column median imputation is applied just for this script — a deliberate, disclosed deviation from scripts 03/04, which pass raw (possibly-missing) values straight to XGBoost.
-
-**Result:**
+Trains `sklearn.tree.DecisionTreeClassifier` and `sklearn.naive_bayes.GaussianNB` on the same warehouse tables, same patient-grouped `GroupKFold(5)` split, and the same AUROC/AUPRC/normalized-utility metrics as the XGBoost models — so these numbers sit directly next to the rest of the results rather than existing in isolation. Each classifier is run twice: once on the 15 raw forward-filled features (matching `03_baseline_model.py`) and once on the full 289-column engineered set (matching `04_engineered_model.py`). Neither model handles missing values natively the way XGBoost does, so a per-column median imputation is applied just for this script — a deliberate, disclosed deviation from the XGBoost scripts, which pass raw (possibly-missing) values straight through.
 
 | Model | AUROC | AUPRC | Normalized utility | Features |
 |---|---|---|---|---|
@@ -303,17 +358,15 @@ Each classifier is run twice: once on the 15 raw forward-filled features (contro
 | Decision Tree (raw) | 0.7056 | 0.0476 | 0.1793 | 15 |
 | Naive Bayes (raw) | 0.6957 | 0.0367 | 0.1410 | 15 |
 
-**The finding:** both classical classifiers land well below XGBoost at every comparable feature count (engineered XGBoost: 0.7918 AUROC vs. engineered Decision Tree: 0.7152, engineered Naive Bayes: 0.7093) — expected, since neither a single decision tree nor a Gaussian-likelihood Bayesian model can capture the kind of nonlinear, high-order feature interactions a 300-tree gradient-boosted ensemble can. What's more interesting is that **engineered features still help both classical models** over their raw-feature counterparts (Decision Tree: +0.0096 AUROC, Naive Bayes: +0.0136 AUROC) — smaller gains than XGBoost saw (+0.0346), but the same direction. This is a useful sanity check: the value of the engineered feature set (§3, `02_feature_engineering.py`) isn't an XGBoost-specific artifact, it transfers across model families, just with diminishing returns for simpler models that can't exploit the extra features as fully.
+Both classical classifiers land well below XGBoost at every comparable feature count (engineered XGBoost: 0.7918 AUROC vs. engineered Decision Tree: 0.7152, engineered Naive Bayes: 0.7093), which is expected — neither a single decision tree nor a Gaussian-likelihood Bayes model can capture the nonlinear, high-order feature interactions a 300-tree gradient-boosted ensemble can. What's more interesting is that **engineered features still help both classical models** over their raw-feature counterparts (Decision Tree: +0.0096 AUROC, Naive Bayes: +0.0136 AUROC) — smaller gains than XGBoost's (+0.0346), but the same direction. That's a useful cross-check: the value of the engineered feature set isn't an XGBoost-specific artifact, it transfers across model families, with diminishing returns for simpler models that can't exploit as much of the extra feature space.
 
-One more note worth including in the report: Naive Bayes' best-utility threshold lands at the sweep floor (0.01) for both feature sets, which is a symptom of Gaussian Naive Bayes' independence assumption producing poorly-calibrated, extreme predicted probabilities on this heavily correlated feature set (rolling stats and raw values for the same vital are, by construction, highly correlated — exactly what "naive" independence assumes away). This doesn't invalidate the AUROC/AUPRC ranking (both are threshold-independent), but it does mean Naive Bayes' probability outputs shouldn't be read as literal risk percentages the way XGBoost's or the Decision Tree's more reasonably can.
+One caveat worth carrying into any downstream use of Naive Bayes here: its best-utility threshold lands at the sweep floor (0.01) for both feature sets — a symptom of Gaussian Naive Bayes' independence assumption producing poorly-calibrated, extreme predicted probabilities on a heavily correlated feature set (rolling stats and raw values for the same vital are, by construction, highly correlated — exactly what "naive" independence assumes away). This doesn't affect the AUROC/AUPRC ranking (both are threshold-independent), but it does mean Naive Bayes' probability outputs shouldn't be read as literal risk percentages the way XGBoost's or the Decision Tree's more reasonably can.
 
-### `11_dbscan_clustering.py` — density-based clustering (third phenotype-discovery method)
+### `11_dbscan_clustering.py` — density-based clustering
 
-**What it does:** closes the last named DWM Module 6 clustering gap. §3's `09_hierarchical_clustering.py` already covers hierarchical (agglomerative) clustering and `clustering_phenotypes.py` covers partition-based (k-means) clustering; Module 6 separately names **density-based clustering**, which neither of those is. This script runs **DBSCAN** on the identical per-patient trajectory summary (mean/std/min/max of `HR`, `O2Sat`, `Temp`, `SBP`, `MAP`, `DBP`, `Resp`) used by the other two clustering scripts, rebuilt directly from `fact_ffill` so it works standalone without needing the other scripts run first.
+A third, structurally different clustering approach on the same per-patient trajectory summary used by the other two clustering scripts (mean/std/min/max of `HR`, `O2Sat`, `Temp`, `SBP`, `MAP`, `DBP`, `Resp`). Unlike k-means or hierarchical clustering, DBSCAN doesn't take a target cluster count — it takes a neighborhood radius `eps` and a minimum point count `min_samples`. `eps` is chosen via the standard **k-distance elbow heuristic**: plot every point's distance to its `min_samples`-th nearest neighbor, sorted ascending, and pick the point of maximum curvature, rather than hand-tuning a value that produces a preferred outcome. `min_samples=10` follows the common rule-of-thumb of roughly 2× dimensionality for this 18-feature space.
 
-Unlike k-means or hierarchical clustering, DBSCAN doesn't take a target cluster count — it takes a neighborhood radius `eps` and a minimum point count `min_samples`. `eps` is chosen via the standard **k-distance elbow heuristic** (Ester et al., 1996): plot every point's distance to its `min_samples`-th nearest neighbor, sorted ascending, and pick the point of maximum curvature as `eps`, rather than hand-picking a value. `min_samples=10` follows the common rule-of-thumb of roughly `2 × dimensionality` for this 18-feature space.
-
-**Result:**
+![DBSCAN k-distance elbow](outputs/figures/dbscan_kdistance_elbow.png)
 
 | | |
 |---|---|
@@ -323,29 +376,25 @@ Unlike k-means or hierarchical clustering, DBSCAN doesn't take a target cluster 
 | Clusters found | **1** |
 | Noise points | 662 (2.0%) |
 
-![DBSCAN k-distance elbow](outputs/figures/dbscan_kdistance_elbow.png)
-
 | Cluster | N patients | Sepsis rate |
 |---|---|---|
 | Noise (`-1`) | 662 | **14.35%** |
 | Cluster 0 | 31,803 | 7.14% |
 
-**The finding:** DBSCAN finds essentially **one dense cluster containing the overwhelming majority of patients, plus a small (2%) noise fraction** rather than multiple genuine clusters — silhouette score isn't even computable in the usual sense since there's only one real cluster to compare against. Read alongside §3's k-means (silhouette 0.154–0.160) and hierarchical (silhouette 0.095) results, this is a **third independent method reaching the same conclusion**: no clean sepsis phenotype exists in this feature space at the whole-patient-trajectory grain. Three structurally different algorithms (partition-based, hierarchical, density-based) converging on "no separable structure" is stronger evidence for that null result than any one method alone — density-based clustering in particular is good at finding irregularly-shaped clusters that k-means' spherical assumption or Ward linkage's variance-minimizing objective could miss, so DBSCAN failing to find structure here isn't just "another vote," it's a check against a specific blind spot the other two methods share.
+DBSCAN finds essentially **one dense cluster containing the overwhelming majority of patients**, plus a small (2%) noise fraction, rather than multiple genuine clusters. Read alongside the k-means (silhouette 0.154–0.160) and hierarchical (silhouette 0.095) results above, this is a **third, structurally different algorithm reaching the same conclusion**: no clean sepsis phenotype exists in this feature space at the whole-patient-trajectory grain. Density-based clustering is specifically good at finding irregularly-shaped clusters that k-means' spherical assumption or Ward linkage's variance-minimizing objective could miss, so its agreement with the other two isn't just "another vote" — it closes off a specific blind spot the other two methods share.
 
-One genuinely interesting aside: the 662 patients DBSCAN labels as **noise** (i.e., don't fit densely into the main cluster — outliers in the trajectory-feature space) have a sepsis rate **exactly double** the main cluster's (14.35% vs. 7.14%). This lines up cleanly with the outlier-analysis finding below (§3, `12_outlier_analysis.py`) that unusual/extreme vitals correlate with sepsis, even though the two analyses use different feature grains (whole-stay trajectory summary here vs. individual patient-hours there) and were run independently.
+A genuinely interesting aside: the 662 patients DBSCAN labels as noise (patients who don't fit densely into the main cluster — i.e., outliers in trajectory-feature space) have a sepsis rate **exactly double** the main cluster's (14.35% vs. 7.14%). This aligns with the outlier-analysis finding below, even though the two analyses use different feature grains (whole-stay trajectory summary here vs. individual patient-hours there) and were computed independently.
 
 ### `12_outlier_analysis.py` — outlier analysis on key vitals
 
-**What it does:** the last of the three DWM Module 6 gaps — **outlier analysis** — named alongside association rules and clustering, and not previously covered anywhere in the pipeline. It's also a genuinely good fit for this dataset: extreme lab values (very high lactate, very high/low temperature) are often the clinical signal itself in sepsis, not noise to be cleaned away, so this analysis is expected to *corroborate* rather than contradict the SHAP (§3, `05_explainability.py`) and association-rule (§3, `08_association_rules.py`) findings.
+Extreme lab values (very high lactate, very high or low temperature) are often the clinical signal itself in sepsis, not noise to be cleaned away — so this analysis is expected to *corroborate*, not contradict, the SHAP and association-rule findings above. Two standard, deliberately simple and interpretable outlier-detection methods are run on the six vitals already shown to matter most (`HR`, `Temp`, `Resp`, `SBP`, `Lactate`, `WBC`), at the patient-hour grain:
 
-Two standard, deliberately simple and interpretable outlier-detection methods are run on six vitals (`HR`, `Temp`, `Resp`, `SBP`, `Lactate`, `WBC` — the same vitals already shown to matter most in SHAP and the association rules), at the patient-hour grain (`fact_ffill`, same table and grain as `03_baseline_model.py`):
+1. **Univariate IQR (Tukey) fencing**, per vital — flag any hour where a vital falls outside `[Q1 − 1.5×IQR, Q3 + 1.5×IQR]`.
+2. **Multivariate Isolation Forest**, across all six vitals jointly, `contamination=0.02` (chosen close to the dataset's own 1.8% positive rate) — catches combinations that look unremarkable one vital at a time but are jointly unusual (e.g. moderately elevated HR *and* moderately low SBP together, neither extreme enough alone to trip an IQR fence).
 
-1. **Univariate IQR (Tukey) fencing**, per vital — flag any hour where a vital falls outside `[Q1 − 1.5×IQR, Q3 + 1.5×IQR]`. The classic, easily explained outlier rule, computed independently for each of the 6 vitals.
-2. **Multivariate Isolation Forest**, across all 6 vitals jointly, `contamination=0.02` (chosen close to the dataset's own 1.8% positive rate so the flagged fraction is a comparable order of magnitude) — catches combinations that look unremarkable one vital at a time but are jointly unusual (e.g. moderately elevated HR *and* moderately low SBP together, neither extreme enough alone to trip an IQR fence).
+Every flag is checked against `SepsisLabel` for **lift**: how much more likely a flagged hour is to be septic than the 1.8% overall base rate.
 
-Every flag is checked against `SepsisLabel` for **lift** — how much more likely a flagged hour is to be septic than the 1.8% overall base rate.
-
-**Result — IQR fence bounds:**
+**IQR fence bounds:**
 
 | Vital | Lower fence | Upper fence |
 |---|---|---|
@@ -356,31 +405,33 @@ Every flag is checked against `SepsisLabel` for **lift** — how much more likel
 | Lactate | −0.45 | 3.79 |
 | WBC | −1.40 | 22.60 |
 
-**Result — sepsis lift by method:**
-
-| Method | % of rows flagged | Sepsis rate (flagged) | Sepsis rate (overall) | Lift |
-|---|---|---|---|---|
-| IQR, `Temp` only | 1.54% | 6.94% | 1.80% | **3.86×** |
-| IQR, 2+ vitals simultaneously | 1.21% | 5.87% | 1.80% | **3.27×** |
-| Isolation Forest (all 6 vitals) | 2.00% | 5.77% | 1.80% | **3.21×** |
-| IQR, `WBC` only | 2.63% | 4.19% | 1.80% | 2.33× |
-| IQR, `Resp` only | 3.78% | 4.51% | 1.80% | 2.51× |
-| IQR, `HR` only | 1.12% | 4.43% | 1.80% | 2.46× |
-| IQR, any single vital | 10.96% | 4.13% | 1.80% | 2.30× |
-| IQR, `Lactate` only | 2.14% | 3.34% | 1.80% | 1.86× |
-| IQR, `SBP` only | 1.14% | 2.17% | 1.80% | 1.20× |
+**Sepsis lift by method:**
 
 ![Outlier sepsis lift](outputs/figures/outlier_sepsis_lift.png)
 
-**The finding:** outlier-flagged hours are consistently, substantially more likely to be septic than the base rate across every method and vital tested — even the weakest (`SBP` alone, 1.20×) shows a positive lift, and the strongest single-vital result (`Temp`, 3.86×) beats the Isolation Forest's full multivariate result. This is a clean validation, from a completely different angle (unsupervised outlier detection, no model training) of the same story the SHAP ranking told in §3: **temperature and lactate carry the strongest individual sepsis signal**, and **combinations of simultaneously-abnormal vitals carry more signal than any single vital alone** (2+ vitals: 3.27× lift vs. 2.30× for any single vital) — the same "compound signals beat single flags" pattern already found independently by the association-rule mining in `08_association_rules.py` (`{Resp_high, Temp_abnormal}` beating `{Temp_abnormal}` alone by ~42%). Three unrelated techniques — SHAP attribution, Apriori association rules, and now outlier lift — all pointing at the same handful of vitals and the same "combinations beat singles" structure is a strong, mutually-reinforcing signal that these are genuine clinical patterns rather than modeling artifacts of any one method.
+| Method | % of rows flagged | Sepsis rate (flagged) | Lift |
+|---|---|---|---|
+| IQR, `Temp` only | 1.54% | 6.94% | **3.86×** |
+| IQR, 2+ vitals simultaneously | 1.21% | 5.87% | **3.27×** |
+| Isolation Forest (all 6 vitals) | 2.00% | 5.77% | **3.21×** |
+| IQR, `Resp` only | 3.78% | 4.51% | 2.51× |
+| IQR, `HR` only | 1.12% | 4.43% | 2.46× |
+| IQR, `WBC` only | 2.63% | 4.19% | 2.33× |
+| IQR, any single vital | 10.96% | 4.13% | 2.30× |
+| IQR, `Lactate` only | 2.14% | 3.34% | 1.86× |
+| IQR, `SBP` only | 1.14% | 2.17% | 1.20× |
 
-Worth noting as a limitation: `SBP`'s weak lift (1.20×) is somewhat expected rather than a red flag — the Sepsis-3 definition this dataset's label is built on emphasizes lactate and organ dysfunction scores over blood pressure directly, and hypotension in sepsis is often a *late* sign compared to fever/tachypnea/elevated lactate, which the stronger-lift vitals here (`Temp`, `Resp`, `Lactate`) more directly capture.
+Outlier-flagged hours are consistently, substantially more likely to be septic than the base rate across every method and vital tested — even the weakest (`SBP` alone, 1.20×) shows a positive lift, and the strongest single-vital result (`Temp`, 3.86×) beats the Isolation Forest's full multivariate result. This is a clean validation, from a third completely different angle (unsupervised outlier detection with no model training involved) of the same story SHAP and the association rules already told: **temperature and lactate carry the strongest individual sepsis signal**, and **combinations of simultaneously-abnormal vitals carry more signal than any single vital alone** (2+ vitals: 3.27× lift vs. 2.30× for any single vital) — the same "compound signals beat single flags" pattern found independently by `08_association_rules.py`.
+
+`SBP`'s weak lift (1.20×) is expected rather than a red flag: the Sepsis-3 definition this dataset's label is built on emphasizes lactate and organ-dysfunction scores over blood pressure directly, and hypotension in sepsis is typically a *later* sign than the fever/tachypnea/elevated-lactate signal the stronger-lift vitals more directly capture.
 
 ### `13_fairness_audit.py` — subgroup performance audit
 
-**What it does:** re-scores the engineered model's out-of-fold predictions, but this time grouped by three demographic/site axes — `age_bracket`, `gender_label`, `hospital_label` — computing AUROC, AUPRC, and normalized utility separately per subgroup, and reporting the largest within-axis gap for each. This is the standard "does the model work equally well for everyone?" audit any clinical ML model needs before deployment can even be discussed, and it directly follows on from the demographic dimensions already sitting in `dim_patient` from script 01.
+Re-scores the engineered model's out-of-fold predictions — the same predictions already saved by `04_engineered_model.py`, so this needs no retraining — grouped by three axes already present in `dim_patient`: `age_bracket`, `gender_label`, `hospital_label`. AUROC, AUPRC, and normalized utility are computed separately per subgroup. This is the standard "does the model work equally well for everyone?" check a clinical model needs before deployment is even a reasonable conversation.
 
-**Result — by subgroup:**
+![Fairness audit by subgroup](outputs/figures/fairness_audit_engineered.png)
+
+**By subgroup:**
 
 | Axis | Group | n patients | AUROC | AUPRC | Normalized utility |
 |---|---|---|---|---|---|
@@ -393,7 +444,7 @@ Worth noting as a limitation: `SBP`'s weak lift (1.20×) is somewhat expected ra
 | Hospital | **hospital_system_2** (best AUROC) | 20,000 | **0.8084** | 0.0805 | 0.2966 |
 | Hospital | **hospital_system_1** (worst AUROC) | 20,336 | **0.7718** | 0.0837 | 0.3350 |
 
-**Gap summary, largest AUROC spread first:**
+**Largest gap per axis:**
 
 | Axis | Max group | Max AUROC | Min group | Min AUROC | Gap |
 |---|---|---|---|---|---|
@@ -401,21 +452,19 @@ Worth noting as a limitation: `SBP`'s weak lift (1.20×) is somewhat expected ra
 | `age_bracket` | 60–74 | 0.8015 | 75+ | 0.7811 | 0.0204 |
 | `gender_label` | Female | 0.7920 | Male | 0.7915 | 0.0005 |
 
-**The headline finding:** gender shows essentially no AUROC disparity (0.0005 gap — noise-level), but **hospital site** is by far the largest fairness axis (0.0366 gap), nearly double the age-bracket gap (0.0204). The oldest patients (75+) are both the worst-served age group by AUROC *and* the group where a missed or late sepsis call is arguably most consequential, which is worth flagging explicitly as a deployment caveat rather than just a number in a table.
+Gender shows essentially no AUROC disparity (0.0005 — noise-level), but **hospital site** is by far the largest fairness axis (0.0366), nearly double the age-bracket gap (0.0204). The oldest patients (75+) are both the worst-served age group by AUROC and the group where a missed or late sepsis call is arguably most consequential — worth flagging explicitly as a deployment caveat.
 
-**A more important, easy-to-miss finding — AUROC parity does not imply utility parity.** Looking at normalized utility (the metric that actually reflects clinical value) instead of AUROC alone flips two of the three rankings:
+**AUROC parity does not imply utility parity.** Looking at normalized utility (the metric that reflects clinical value, not just ranking quality) flips two of the three rankings:
 
-- **Hospital:** `hospital_system_2` has the *higher* AUROC (0.8084) but the *lower* utility (0.2966); `hospital_system_1` has the *lower* AUROC (0.7718) but the *higher* utility (0.3350). A single shared decision threshold interacts with each hospital's local prevalence and score distribution differently, so the hospital that ranks patients better in relative terms (AUROC) isn't necessarily the hospital where the model's alerts translate into better time-weighted outcomes.
-- **Gender:** near-identical AUROC (0.7920 vs 0.7915) but a large utility gap (0.2914 for Female vs 0.3401 for Male, a ~17% relative difference) — the ranking-quality metric says "no disparity," while the deployment-relevant metric says otherwise.
-- **Age** is the one axis where AUROC and utility agree directionally (60–74 best on both, 75+ worst on both), which makes it the most straightforwardly interpretable of the three gaps.
+- **Hospital:** `hospital_system_2` has the *higher* AUROC (0.8084) but the *lower* utility (0.2966); `hospital_system_1` has the *lower* AUROC (0.7718) but the *higher* utility (0.3350). A single shared decision threshold interacts with each hospital's local prevalence and score distribution differently, so the hospital that ranks patients better in relative terms isn't necessarily the hospital where alerts translate to better time-weighted outcomes.
+- **Gender:** near-identical AUROC (0.7920 vs. 0.7915) but a large utility gap (0.2914 for Female vs. 0.3401 for Male — a ~17% relative difference). The ranking-quality metric says "no disparity"; the deployment-relevant metric says otherwise.
+- **Age** is the one axis where AUROC and utility agree directionally (60–74 best on both, 75+ worst on both), making it the most straightforwardly interpretable of the three gaps.
 
-A fairness audit that stopped at AUROC would have reported "gender: fine, hospital: some gap, age: some gap" and missed that the threshold-dependent utility metric tells a materially different — and, for a deployment-facing document, more relevant — story. That's why both metrics are reported side by side here rather than just one.
+A fairness audit that stopped at AUROC would have reported "gender: fine, hospital: some gap, age: some gap" and missed that the threshold-dependent utility metric tells a materially different, and more deployment-relevant, story — which is why both are reported side by side rather than just one.
 
-### `14_cross_hospital_generalization.py` — does the model transfer across hospital systems?
+### `14_cross_hospital_generalization.py` — does the model transfer across hospitals?
 
-**What it does:** a stricter generalization test than ordinary k-fold cross-validation. Instead of training and testing on a random patient-level split drawn from *both* hospitals (as every prior script does), this trains on **one hospital entirely** and tests on **the other hospital entirely**, in both directions, and compares against the in-distribution (mixed-hospital) result already on file from `04_engineered_model.py`.
-
-**Result:**
+A stricter generalization test than ordinary k-fold cross-validation. Instead of training and testing on a random patient-level split drawn from *both* hospitals (as every other script does), this trains on **one hospital entirely** and tests on **the other hospital entirely**, in both directions, and compares against the in-distribution (mixed-hospital) result already on file from `04_engineered_model.py`.
 
 | Direction | Train n | Test n | AUROC | AUPRC | Best-threshold utility |
 |---|---|---|---|---|---|
@@ -423,19 +472,17 @@ A fairness audit that stopped at AUROC would have reported "gender: fine, hospit
 | B: train hospital 2 → test hospital 1 | 20,000 | 20,336 | 0.7226 | 0.0609 | 0.2439 (threshold 0.46) |
 | In-distribution (mixed, `GroupKFold`) | — | — | **0.7918** | **0.0821** | **0.3203** |
 
-**The headline finding:** generalizing across hospital systems costs the model **0.05–0.07 AUROC and roughly 25–40% of its clinical utility**, relative to the in-distribution result. Utility takes the harder hit than AUROC in both directions (utility drops 40% in direction A, 24% in direction B, vs. AUROC drops of 7% and 9% respectively) — consistent with utility being threshold-sensitive and thus more exposed to a shift in the *score distribution* between hospitals, not just a shift in ranking quality.
+Generalizing across hospital systems costs the model **0.05–0.07 AUROC and roughly 25–40% of its clinical utility**, relative to the in-distribution result. Utility takes the harder hit than AUROC in both directions (utility drops 40% in direction A, 24% in direction B, vs. AUROC drops of 7% and 9% respectively) — consistent with utility being threshold-sensitive and therefore more exposed to a shift in the *score distribution* between hospitals, not just a shift in ranking quality.
 
-This result is the direct causal explanation for the hospital-axis gap already surfaced in `13_fairness_audit.py`: a mixed-hospital model trained with `GroupKFold` sees both hospitals during training, and the 0.0366 AUROC gap in the fairness audit is what's left over from site-specific distribution shift *even after* training on both. This cross-hospital experiment isolates that same shift in its more extreme form — what happens if the model has *never seen the target hospital at all* — and shows the gap roughly doubles (0.05–0.07 vs. 0.0366) under that harder condition. Read together, §8's fairness audit and this generalization test tell one consistent story: hospital site is a real, non-trivial source of distribution shift in this dataset, more so than age or gender, and a model trained at one site should not be assumed to transfer to another without re-validation.
+This result is the direct causal explanation for the hospital-axis gap already surfaced by `13_fairness_audit.py`: a mixed-hospital model trained with `GroupKFold` sees both hospitals during training, and the 0.0366 AUROC gap in the fairness audit is what's left over from site-specific distribution shift *even after* training on both. This experiment isolates that same shift in its more extreme form — what happens if the model has never seen the target hospital at all — and shows the gap roughly doubles (0.05–0.07 vs. 0.0366) under that harder condition. Read together, the two scripts tell one consistent story: hospital site is a real, non-trivial source of distribution shift in this dataset, more so than age or gender, and a model trained at one site should not be assumed to transfer to another without re-validation.
 
-**Practical implication:** if this model were ever deployed at a hospital not represented in the training data, these numbers — not the headline 0.7918 in-distribution AUROC — are the honest expectation for out-of-the-box performance, and local recalibration/threshold-tuning at minimum, ideally a hospital-specific fine-tune, should be treated as a deployment prerequisite rather than a nice-to-have.
+**Practical implication:** if this model were ever deployed at a hospital not represented in the training data, these numbers — not the headline 0.7918 in-distribution AUROC — are the honest expectation for out-of-the-box performance, and local recalibration or threshold-tuning at minimum (ideally a hospital-specific fine-tune) should be treated as a deployment prerequisite, not a nice-to-have.
 
-### `15_conformal_prediction.py` — calibrated uncertainty via split conformal classification
+### `15_conformal_prediction.py` — calibrated uncertainty via split-conformal classification
 
-**What it does:** wraps the engineered XGBoost model with **split conformal prediction** (via the [MAPIE](https://mapie.readthedocs.io/) library's `SplitConformalClassifier`) to produce, for every patient-hour, a *prediction set* rather than a single point probability — i.e., instead of "12% chance of sepsis," the output is a set like `{no-sepsis}`, `{sepsis}`, or `{no-sepsis, sepsis}` (both, meaning "the model is not confident enough to commit"), with a **distribution-free statistical guarantee** that the true label falls inside the predicted set at least 90% of the time (`confidence_level=0.9`), regardless of the underlying model's calibration quality.
+Wraps the engineered XGBoost model with **split conformal prediction** (via [MAPIE](https://mapie.readthedocs.io/)'s `SplitConformalClassifier`) to produce, for every patient-hour, a *prediction set* rather than a single point probability. Instead of "12% chance of sepsis," the output is a set like `{no-sepsis}`, `{sepsis}`, or `{no-sepsis, sepsis}` (both — "the model isn't confident enough to commit"), with a **distribution-free statistical guarantee** that the true label falls inside the predicted set at least 90% of the time (`confidence_level=0.9`), regardless of how well-calibrated the underlying model's probabilities actually are.
 
-**Data split** (three-way, on top of the usual patient-level grouping): 24,201 patients / 932,292 rows for training the base model, 8,067 patients / 309,265 rows held out purely for **conformal calibration** (computing the nonconformity-score threshold), and 8,068 patients / 310,653 rows for the final test evaluation — calibration and test sets must be disjoint from each other and from training for the coverage guarantee to hold.
-
-**Result:**
+**Data split** (a three-way split on top of the usual patient-level grouping): 24,201 patients / 932,292 rows for training the base model, 8,067 patients / 309,265 rows held out purely for **conformal calibration** (computing the nonconformity-score threshold), and 8,068 patients / 310,653 rows for final test evaluation — calibration and test sets must be disjoint from each other and from training for the coverage guarantee to hold.
 
 | Metric | Value |
 |---|---|
@@ -450,85 +497,51 @@ This result is the direct causal explanation for the hospital-axis gap already s
 | Normalized utility, full test cohort | 0.3217 |
 | Normalized utility, confident hours only | **0.3871** |
 
-**The headline finding — empirical coverage matches the target almost exactly:** 89.74% observed vs. 90% target is well within expected sampling noise for a calibration set of this size, which is exactly what a correctly-implemented split conformal method should produce. This is the whole point of conformal prediction over an ad-hoc probability threshold: the 90% guarantee isn't a hope, it's a property that's been empirically checked and holds.
+**Empirical coverage matches the target almost exactly:** 89.74% observed vs. 90% target is well within expected sampling noise for a calibration set of this size — exactly what a correctly-implemented split-conformal method should produce. This is the whole point of conformal prediction over an ad-hoc probability threshold: the 90% guarantee isn't a hope, it's a property that's been empirically checked and holds.
 
-**The uncertainty flag is doing real work, not just padding:** accuracy on the 16.56% of hours flagged as uncertain (57.52%) is barely better than a coin flip, while accuracy on the 83.44% of hours the model is confident about is 87.71% — a **30-point accuracy gap**. This is precisely the desired behavior: the conformal set isn't just adding noise, it's correctly identifying the subset of patient-hours where the point prediction is unreliable, which is the actionable clinical signal ("route this patient-hour to a human for a second look") that a bare probability score doesn't give you.
+**The uncertainty flag is doing real work, not padding:** accuracy on the 16.56% of hours flagged as uncertain (57.52%) is barely better than a coin flip, while accuracy on the 83.44% of hours the model is confident about is 87.71% — a **30-point accuracy gap**. This is exactly the desired behavior: the conformal set is correctly identifying the subset of patient-hours where the point prediction is unreliable, which is a genuinely actionable clinical signal ("route this patient-hour to a human for a second look") that a bare probability score doesn't give you.
 
-**Restricting to confident predictions raises clinical utility by ~20%:** normalized utility on the confident-only subset (0.3871) is notably higher than on the full test cohort (0.3217, which is itself consistent with the 0.3203 in-distribution result from `04_engineered_model.py` — a useful cross-check that this held-out split reproduces the earlier headline number). In a real deployment, this suggests a two-tier alerting design: act automatically/high-confidence on the ~83% of hours the model is sure about, and route the ~17% flagged as uncertain to clinician review rather than trusting the point estimate blindly — the empty-set rate of exactly 0.00% also confirms the conformal procedure never produces a degenerate "neither label is plausible" output, which would be hard to act on operationally.
-
-**Engineering note:** this script depends on the `mapie` package (`pip install "mapie>=1.0"`, added to `requirements.txt`), which is not required by any other script in the pipeline — worth calling out in setup instructions so a fresh clone doesn't fail on `ModuleNotFoundError: No module named 'mapie'` the way the first run here did.
+**Restricting to confident predictions raises clinical utility by ~20%:** normalized utility on the confident-only subset (0.3871) is notably higher than on the full test cohort (0.3217 — itself consistent with the 0.3203 in-distribution result from `04_engineered_model.py`, a useful cross-check that this held-out split reproduces the earlier headline number). This suggests a two-tier alerting design in practice: act automatically on the ~83% of hours the model is sure about, and route the ~17% flagged as uncertain to clinician review rather than trusting the point estimate blindly. The empty-set rate of exactly 0.00% also confirms the conformal procedure never produces a degenerate "neither label is plausible" output, which would be hard to act on operationally.
 
 ### `delong.py` and `utility_score.py` — shared helper modules
 
-- **`delong.py`** implements DeLong's test for comparing two correlated AUROCs (used by `04_engineered_model.py`) — this is the statistically correct way to compare two models' AUROC on the *same* test set, since a naive "is 0.79 > 0.76" comparison doesn't account for the fact that both numbers were estimated with sampling uncertainty.
-- **`utility_score.py`** implements the PhysioNet/CinC 2019 Challenge's own **clinical utility metric** — a time-weighted scoring function that rewards early true-positive predictions, penalizes false positives, and penalizes late/missed true positives, normalized so a perfect predictor scores 1.0 and a "never predict sepsis" predictor scores 0.0. This is a more clinically meaningful headline number than AUROC alone, which is why it's reported alongside AUROC/AUPRC throughout the project — including the fairness audit, cross-hospital test, and conformal prediction results in §8.
-
----
-
-## 4. Key engineering incident: the OOM crash
-
-Running `04_engineered_model.py` (full 289-feature DataFrame + 35 total XGBoost fits — 7 ablation configurations × 5 `GroupKFold` folds each) on a 7.4GB RAM laptop (Arch Linux / Hyprland) caused `systemd-oomd` to kill **the entire desktop session**, not just the Python process.
-
-**Root cause:** loading the full 289-column float64 DataFrame into pandas, then repeatedly slicing it per-ablation-run, multiplied memory usage far beyond what the raw data size would suggest — float64 storage plus pandas' copy-on-slice behavior meant peak memory was several times the base dataset size.
-
-**Fix, three changes:**
-1. **`CAST ... AS FLOAT` at the DuckDB SQL query level**, not after loading into pandas — halves the memory footprint per column (float32 vs float64) *before* the data ever reaches Python.
-2. **NumPy array conversion instead of repeated pandas slicing** — pandas DataFrame slicing during the ablation loop was creating redundant copies; converting to `.values` once and slicing NumPy arrays avoided that.
-3. **`gc.collect()` between ablation runs** — explicitly forces garbage collection of the previous run's XGBoost booster and training arrays before starting the next, rather than relying on Python's reference-counting GC to happen "eventually."
-
-This incident is documented here on purpose, not hidden — it's a legitimate example of production-relevant memory-management engineering, not just modeling.
+- **`delong.py`** implements DeLong's test for comparing two correlated AUROCs (used by `04_engineered_model.py`) — the statistically correct way to compare two models' AUROC on the *same* test set, since a naive "0.79 > 0.76, so it's better" comparison ignores that both numbers carry sampling uncertainty.
+- **`utility_score.py`** re-implements the PhysioNet/CinC 2019 Challenge's own **clinical utility metric**, verified against the Challenge's reference implementation and vectorized with NumPy per-patient for speed on ~40k patients. It's a time-weighted scoring function that rewards early true-positive predictions, penalizes false positives, and penalizes late or missed true positives, normalized so a perfect predictor scores 1.0 and a "never predict sepsis" predictor scores 0.0. This is a substantially more clinically meaningful headline number than AUROC alone, which is why it's reported alongside AUROC/AUPRC throughout the project, including the fairness audit, cross-hospital test, and conformal-prediction results above.
 
 ---
 
 ## 5. Leakage handling
 
-Three categories of leakage were explicitly checked and are documented (including the one that couldn't be avoided):
+Three categories of leakage were explicitly checked and are documented — including the one that couldn't be avoided:
 
 | Type | Status | How it was handled |
 |---|---|---|
-| **Patient leakage** | Prevented | `GroupKFold(5)` splits by `patient_id` in every model-training script; disjoint train/test patient sets asserted every fold |
-| **Temporal leakage** | Prevented | All window-function features in `02_feature_engineering.py` use causal-only SQL windows (`ROWS BETWEEN N PRECEDING AND CURRENT ROW`, never `FOLLOWING`) |
-| **Label-construction leakage** | **Present, documented as a limitation, not hidden** | `SepsisLabel` is derived from Sepsis-3 criteria that reference some of the same lab values (e.g., lactate) used as model features. This is a known property of the PhysioNet Challenge 2019 dataset itself, not a bug introduced by this pipeline — but it means the reported AUROC/AUPRC should be read as "how well can the model reconstruct the Sepsis-3 rule from correlated inputs," not purely as an independent clinical prediction task. |
+| **Patient leakage** | Prevented | `GroupKFold(5)` splits by `patient_id` in every model-training script; disjoint train/test patient sets are asserted every fold, every run |
+| **Temporal leakage** | Prevented | Every window-function feature in `02_feature_engineering.py` uses causal-only SQL windows (`ROWS BETWEEN N PRECEDING AND CURRENT ROW`, never `FOLLOWING`) |
+| **Label-construction leakage** | **Present — a genuine dataset property, disclosed rather than hidden** | `SepsisLabel` is derived from Sepsis-3 criteria that reference some of the same lab values (e.g. lactate) used as model features. This is a known property of the PhysioNet Challenge 2019 dataset itself, not something introduced by this pipeline — but it means the reported AUROC/AUPRC should be read as "how well the model can reconstruct the Sepsis-3 rule from correlated inputs," not as a fully independent clinical prediction task from first principles. |
 
 ---
 
-## 6. Syllabus gap analysis (why scripts 07–12 exist)
-
-The project was checked against the actual DWM and FE lab syllabi (D.Y. Patil / Ramrao Adik Institute, NEP-24, Sem V) — specifically DWM Module 5 (data mining process, KDD, pre-processing) and Module 6 (association rules, classification, clustering), the modules the DWM professor specified this capstone should be based on. The original project scope only had XGBoost modeling and k-means clustering — no OLAP demonstration, no association rule mining, no named classical classifiers, no density-based clustering, and no outlier analysis, despite Module 6 explicitly naming all of these as separate graded lab experiments. Six scripts were added specifically to close these gaps, rather than being part of the original modeling plan:
-
-| Gap in Module 6 | Script that closes it |
-|---|---|
-| OLAP cube operations (roll-up, drill-down, slice, dice) | `07_olap_and_export.py` |
-| Association rule mining / Apriori | `08_association_rules.py` |
-| Hierarchical clustering | `09_hierarchical_clustering.py` |
-| Classification: Decision Tree Induction & Bayesian classification | `10_classical_classifiers.py` |
-| Density-based clustering | `11_dbscan_clustering.py` |
-| Outlier analysis | `12_outlier_analysis.py` |
-
-With all six in place, every named technique in Module 6 — association rules, classification (now including the specific algorithms named, not just XGBoost), all three major clustering families (partition-based, hierarchical, density-based), and outlier analysis — has a corresponding script and a reported result, not just the supervised prediction task the project originally centered on.
-
----
-
-## 7. Results summary
+## 6. Results summary
 
 | Model / Analysis | Headline metric |
 |---|---|
 | Baseline (15 raw features) | AUROC 0.7572, AUPRC 0.0634, utility 0.2504 |
 | Engineered (289 features) | AUROC 0.7918, AUPRC 0.0821, utility 0.3203 |
-| Statistical significance | DeLong z = −38.30, p ≈ 0 |
+| Statistical significance (DeLong) | z = −38.30, p ≈ 0 |
 | Best single feature family | `rolling_stats` alone → AUROC 0.7737 |
 | Top SHAP feature | `Lactate_max_12h` |
 | Sepsis patients caught (≥1 alert) | 87.6%, median 22h lead time |
-| False-alarm rate vs. naive SIRS≥2 (matched sensitivity) | 0.127 vs. 0.289 (~2x fewer) |
+| False-alarm rate vs. naive SIRS≥2 (matched sensitivity) | 0.127 vs. 0.289 (~2× fewer) |
 | Best association rule | `{Resp_high, Temp_abnormal}` → Sepsis, lift 2.83 |
 | Clustering (k-means, k=2) | silhouette 0.154–0.160, no sepsis-rate separation |
 | Clustering (hierarchical, k=2) | silhouette 0.095, no sepsis-rate separation |
+| Clustering (DBSCAN) | 1 cluster + 2.0% noise; noise has 2× the main cluster's sepsis rate |
 | Best classical classifier | Decision Tree (engineered) — AUROC 0.7152, AUPRC 0.0540 |
-| Classical vs XGBoost gap | XGBoost +0.0766 AUROC over best classical classifier (engineered features) |
-| Clustering (DBSCAN) | 1 cluster + 2.0% noise; noise points have 2× the sepsis rate of the main cluster |
+| Classical vs. XGBoost gap | XGBoost +0.0766 AUROC over best classical classifier (engineered features) |
 | Best outlier-vs-sepsis lift | `Temp` IQR outliers → 3.86× sepsis rate vs. base rate |
 | Compound outlier lift | 2+ simultaneously-abnormal vitals → 3.27× lift (vs. 2.30× for any single vital) |
-| Largest fairness gap (AUROC) | hospital site, 0.0366 (h2=0.8084 vs h1=0.7718) |
+| Largest fairness gap (AUROC) | hospital site, 0.0366 (h2=0.8084 vs. h1=0.7718) |
 | AUROC-vs-utility disconnect | gender AUROC gap ≈0, but utility gap ≈17% relative |
 | Cross-hospital generalization (avg. of both directions) | AUROC ≈0.73, utility ≈0.22 (vs. 0.7918 / 0.3203 in-distribution) |
 | Conformal coverage (target 90%) | 89.74% empirical |
@@ -536,83 +549,34 @@ With all six in place, every named technique in Module 6 — association rules, 
 | Accuracy: confident vs. uncertain hours (conformal) | 87.71% vs. 57.52% |
 | Utility, confident-only subset vs. full cohort (conformal) | 0.3871 vs. 0.3217 (+~20%) |
 
----
-
-## 8. Fairness, generalization & uncertainty quantification (why scripts 13–15 exist)
-
-Scripts `01`–`12` answer "can this be predicted, and how well" (a modeling question) plus the Module 6 syllabus requirements (§6). Scripts `13`–`15` answer a different, arguably more important question for anything touching real patients: **where does this model quietly fail, and does it know when it doesn't know?** Unlike scripts 07–12, these three weren't added to close a named syllabus gap — they were added to move the project from "here's a model with a good AUROC" toward "here's a model whose failure modes, subgroup behavior, and calibrated uncertainty have actually been characterized," which is the standard a clinical ML project needs to meet before deployment is even a reasonable conversation.
-
-1. **Does performance vary by who the patient is or which hospital they're in?** (`13_fairness_audit.py`) — yes, and the largest gap is by hospital site (0.0366 AUROC), not by age (0.0204) or gender (0.0005). More importantly, ranking-quality parity (AUROC) and clinical-value parity (normalized utility) don't always move together — gender looks fine on AUROC but shows a 17%-relative utility gap, and the hospital with the *better* AUROC has the *worse* utility. A fairness audit that only checks AUROC would have missed both of these.
-
-2. **Does the model actually transfer to a hospital it has never seen?** (`14_cross_hospital_generalization.py`) — no, not cleanly. Training on one hospital and testing on the other costs 0.05–0.07 AUROC and 25–40% of clinical utility relative to the in-distribution result, a substantially bigger drop than the 0.0366 in-distribution hospital gap from the fairness audit. Read together, these two scripts show the same underlying phenomenon (hospital-site distribution shift) at two different intensities: partially mitigated when the model trains on both hospitals (script 13's fairness audit), and much more exposed when it's forced to generalize from one to the other with zero exposure to the target site (script 14, this one).
-
-3. **When the model is wrong, does it at least know it's uncertain?** (`15_conformal_prediction.py`) — yes, reliably. The conformal wrapper hits its 90% coverage target almost exactly (89.74% empirical), and the 16.56% of hours it flags as "uncertain" have a 30-point-lower accuracy (57.52% vs. 87.71%) than the hours it's confident about. That gap is the practically useful part: it means the uncertainty flag is a real, actionable signal for routing hours to human review, not statistical noise — and restricting the utility calculation to confident hours only lifts normalized utility by roughly 20% (0.3871 vs. 0.3217), a concrete illustration of what a "model + human-in-the-loop on uncertain cases" deployment pattern could buy in practice.
-
-**The combined takeaway for a deployment-facing reader:** the single headline AUROC (0.7918) understates how unevenly this model performs across hospital sites and, to a lesser extent, age groups, and overstates how well it would perform at a hospital it wasn't trained on. Conformal prediction offers a partial mitigation — not for the fairness gap itself, but for the more general problem of not knowing which predictions to trust — by explicitly separating "confident enough to act on" from "needs a second opinion," a meaningfully different (and more honest) product than a single probability threshold.
+**Reading these together:** the single headline AUROC (0.7918) understates how unevenly this model performs across hospital sites and, to a lesser extent, age groups, and it overstates how well the model would perform at a hospital it wasn't trained on. Conformal prediction offers a partial mitigation — not for the fairness gap itself, but for the more general problem of not knowing which individual predictions to trust — by explicitly separating "confident enough to act on" from "needs a second opinion," which is a meaningfully more honest deployment pattern than a single shared probability threshold.
 
 ---
 
-## 9. Known limitations / honest caveats
+## 7. Limitations and honest caveats
 
-- **Label-construction leakage** (§5) — `SepsisLabel` shares some inputs with model features; results should be read accordingly.
-- **No sepsis phenotype found** — all three clustering methods (k-means, hierarchical, DBSCAN) return a null result (§3, clustering sections). Reported as-is rather than cherry-picking a k, `eps`, or method that looks more interesting.
-- **Minor patient-count discrepancies across scripts** — `01_etl_warehouse.py` loads 40,336 patients total, but complete-case filtering (dropping any patient with missing values in the feature set) drops this to different numbers depending on which columns a given script's query happens to require: 32,465 for the original k-means run, 31,857 for the hierarchical clustering script. This is expected behavior from complete-case filtering on slightly different column sets, not a bug, but it's worth a one-line footnote in the final report so it doesn't look like an inconsistency.
-- **AUROC-optimized threshold vs. clinical operating point** — the "best utility" threshold (0.500) used for the alarm-fatigue analysis produces higher sensitivity (59.98%) but a higher false-alarm rate (0.180) than the threshold matched to the naive rule's sensitivity (0.127 false-alarm rate at 50.72% sensitivity). Which threshold is "right" depends on the clinical tolerance for false alarms vs. missed cases — this is a genuine deployment decision, not something the model alone can answer.
-- **Classical classifiers aren't tuned to compete with XGBoost** — `10_classical_classifiers.py`'s Decision Tree and Naive Bayes use reasonable, undramatic defaults (`max_depth=6`, `class_weight="balanced"` for the tree; untouched `GaussianNB`), not an exhaustively-tuned configuration. Their purpose is to demonstrate the named Module 6 techniques and show the engineered-feature lift transfers across model families, not to claim they're competitive alternatives to the boosted-tree model — the report should be explicit that the ~0.08 AUROC gap to XGBoost reflects model capacity, not an unfair comparison.
-- **DBSCAN found effectively one cluster, not a clustering** — with `eps` chosen by the standard k-distance elbow method (not hand-tuned to produce a particular outcome), DBSCAN places 98% of patients in a single dense cluster. This is reported as the honest result, consistent with k-means and hierarchical clustering's own null findings (§3, §7), rather than re-tuning `eps`/`min_samples` until multiple clusters appear — doing so would risk manufacturing structure that isn't really there just to have a more "interesting" result to report.
-- **IQR fences and Isolation Forest contamination rate are simple, disclosed heuristics, not optimized thresholds** — the 1.5× IQR multiplier is the standard Tukey convention, and Isolation Forest's `contamination=0.02` was chosen to be close to the dataset's actual 1.8% sepsis rate rather than fitted to maximize lift. Both are defensible, standard choices, but neither was tuned to produce the best possible lift numbers, so the reported lift values (2.3×–3.9×) should be read as a reasonable first-pass signal, not an optimized outlier-detection system.
-- **Hospital-site performance gap, both in-distribution and out-of-distribution** (§8) — the model is measurably worse for `hospital_system_1` by AUROC (though better by utility — see §8's discussion of the AUROC/utility disconnect), and generalizes poorly to a hospital it wasn't trained on (AUROC drops to 0.72–0.74, utility drops 25–40%). Any deployment at a new site should treat the in-distribution 0.7918 AUROC as an optimistic ceiling, not an expectation.
-- **75+ age group is both the worst-served and arguably the highest-stakes group** (§8) — a 0.02 AUROC gap sounds small in isolation, but it's the largest age-bracket gap observed, on the subgroup where a missed sepsis alert plausibly carries the most clinical risk. Worth flagging explicitly rather than averaging it away in an overall AUROC.
-- **Conformal guarantee is marginal, not conditional** (§8) — the 90% coverage guarantee from `15_conformal_prediction.py` holds on average across the whole calibration/test distribution, not provably per-subgroup. Given the fairness gaps found by `13_fairness_audit.py` (§8), it would be worth checking in a follow-up whether coverage holds equally well within each hospital/age subgroup, or whether the "uncertain" flag is itself unevenly distributed across those same groups — this hasn't been checked yet.
-- **`mapie` is a new pipeline dependency** (§3, script 15) — not required by any other script, so it's easy for a fresh environment to miss it; make sure `requirements.txt` is followed exactly (`pip install -r requirements.txt`) rather than reproducing scripts 01–12's environment and assuming it's sufficient for script 15.
+These are stated plainly rather than smoothed over, along with why each one is what it is:
+
+- **Label-construction leakage (§5).** `SepsisLabel` shares some inputs (e.g. lactate) with the model's own features, because that's how the Sepsis-3 definition this dataset's label is built on works. This is a property of the dataset, not a bug in this pipeline, but it means the reported AUROC/AUPRC should be read as "how well the model reconstructs the Sepsis-3 rule from correlated clinical inputs," not as proof of a fully independent early-warning signal.
+- **No sepsis phenotype found.** All three clustering methods (k-means, hierarchical, DBSCAN) return a null result. This is reported as-is, not concealed or re-parameterized until a more "interesting" clustering appeared, because a null result honestly obtained is still a real finding.
+- **Minor patient-count differences across scripts.** `01_etl_warehouse.py` loads 40,336 patients total, but complete-case filtering (dropping any patient with missing values in a given script's required columns) lands on different final counts depending on exactly which columns that script needs — 32,465 for the k-means run, 31,857 for hierarchical clustering, for example. This is the expected, mechanical consequence of complete-case filtering on slightly different column sets per script, not an inconsistency in the underlying data.
+- **The AUROC-optimal decision threshold and the "clinically comfortable" threshold are different.** The best-utility threshold (0.500) used for the alarm-fatigue analysis produces higher sensitivity (59.98%) but a higher false-alarm rate (0.180) than the threshold matched to the naive rule's sensitivity (0.127 false-alarm rate at 50.72% sensitivity). Which threshold is "right" depends on a clinical site's tolerance for false alarms vs. missed cases — a genuine deployment decision the model itself cannot make.
+- **The classical classifiers (`10_classical_classifiers.py`) are not tuned to compete with XGBoost.** Decision Tree and Naive Bayes use reasonable, undramatic defaults (`max_depth=6`, `class_weight="balanced"` for the tree; untouched `GaussianNB`), not an exhaustively-optimized configuration. Their purpose is to demonstrate that the engineered feature set's lift transfers across model families, not to claim they're competitive alternatives to the boosted-tree model — the ~0.08 AUROC gap to XGBoost reflects model capacity, not an unfair comparison.
+- **DBSCAN finds effectively one cluster.** With `eps` chosen by the standard k-distance elbow method (not hand-tuned to force a particular outcome), DBSCAN places 98% of patients in a single dense cluster. This is the honest result, consistent with the other two clustering methods' own null findings, rather than re-tuning `eps`/`min_samples` until multiple clusters appear — doing that would risk manufacturing structure that isn't really there.
+- **The IQR fences and Isolation Forest contamination rate are simple, disclosed heuristics, not optimized thresholds.** The 1.5× IQR multiplier is the standard Tukey convention, and Isolation Forest's `contamination=0.02` was chosen close to the dataset's actual 1.8% sepsis rate rather than fitted to maximize lift. Both are defensible, standard choices, but neither was tuned to produce the best possible lift numbers, so the reported lift values (2.3×–3.9×) should be read as a reasonable first-pass signal, not an optimized outlier-detection system.
+- **Age 90+ is capped in the source data** for de-identification, as part of PhysioNet's own release process — this specifically affects the "75+" age bracket used in the fairness audit, which is worth keeping in mind when interpreting that bracket's results, since it isn't a clean, uncensored age distribution.
+- **Hospital-site performance gap, both in-distribution and out-of-distribution (§6, §4 scripts 13–14).** The model is measurably worse for `hospital_system_1` by AUROC (though better by utility — see the AUROC/utility disconnect discussed in §4), and generalizes poorly to a hospital it wasn't trained on (AUROC drops to 0.72–0.74, utility drops 25–40%). Any deployment at a new site should treat the in-distribution 0.7918 AUROC as an optimistic ceiling, not an expectation.
+- **The 75+ age group is both the worst-served and arguably the highest-stakes group.** A 0.02 AUROC gap sounds small in isolation, but it's the largest age-bracket gap observed, on the subgroup where a missed sepsis alert plausibly carries the most clinical risk — worth flagging explicitly rather than averaging it away in an overall AUROC.
+- **The conformal guarantee is marginal, not conditional.** The 90% coverage guarantee from `15_conformal_prediction.py` holds on average across the whole calibration/test distribution, not provably per-subgroup. Given the fairness gaps found in §4/§6, it would be worth checking in a follow-up analysis whether coverage holds equally well within each hospital/age subgroup, or whether the "uncertain" flag is itself unevenly distributed across those same groups — this hasn't been checked yet, and is flagged here rather than assumed away.
+- **This is real clinical data, but a research pipeline, not a validated clinical product.** Every result above should be read as evidence for what's learnable from this dataset with this methodology, not as a claim of readiness for bedside deployment — cross-hospital generalization, subgroup fairness, and label-construction leakage are all reasons a real deployment would need substantially more validation than what's shown here.
 
 ---
 
-## 10. Repository structure & how to reproduce
+## 8. Reproducing this project
 
-```
-sepsis_capstone/
-├── src/
-│   ├── 01_etl_warehouse.py
-│   ├── 02_feature_engineering.py
-│   ├── 03_baseline_model.py
-│   ├── 04_engineered_model.py
-│   ├── 05_explainability.py
-│   ├── 06_leadtime_alarm_fatigue.py
-│   ├── 07_olap_and_export.py
-│   ├── 08_association_rules.py
-│   ├── 09_hierarchical_clustering.py
-│   ├── 10_classical_classifiers.py
-│   ├── 11_dbscan_clustering.py
-│   ├── 12_outlier_analysis.py
-│   ├── 13_fairness_audit.py
-│   ├── 14_cross_hospital_generalization.py
-│   ├── 15_conformal_prediction.py
-│   ├── clustering_phenotypes.py
-│   ├── delong.py
-│   └── utility_score.py
-├── outputs/
-│   ├── *.csv                    (metrics, cluster profiles, rule tables, OLAP demo tables,
-│   │                              classical_classifier_results.csv, dbscan_cluster_profiles.csv,
-│   │                              dbscan_manifest.csv, outlier_sepsis_lift.csv, outlier_iqr_bounds.csv,
-│   │                              fairness_engineered_by_*.csv, fairness_engineered_gap_summary.csv,
-│   │                              cross_hospital_results.csv, conformal_prediction_summary.csv)
-│   ├── *.parquet                (out-of-fold predictions, for independent metric verification —
-│   │                              including one per classical classifier from script 10, cross-hospital
-│   │                              preds from script 14, and conformal predictions from script 15)
-│   ├── run*_log.txt             (stdout logs from each script run)
-│   ├── figures/                 (SHAP plots, dendrogram, silhouette plot, dbscan_kdistance_elbow.png,
-│   │                              outlier_sepsis_lift.png, fairness_audit_engineered.png)
-│   └── powerbi_export/          (dim_patient.csv, dim_hospital.csv, fact_vitals_olap.csv)
-├── warehouse/
-│   └── sepsis.duckdb            (gitignored — large binary, share via Google Drive)
-├── requirements.txt
-└── README.md
-```
-
-**To reproduce:**
 ```bash
-# 1. Place raw PhysioNet .psv files where 01_etl_warehouse.py expects them
+# 1. Place raw PhysioNet .psv files under data/raw/<hospital_folder>/*.psv
+#    (each subfolder is treated as one "hospital system")
 python src/01_etl_warehouse.py
 python src/02_feature_engineering.py
 python src/03_baseline_model.py
@@ -631,16 +595,8 @@ python src/14_cross_hospital_generalization.py
 python src/15_conformal_prediction.py
 ```
 
-Scripts 10–12 only depend on `02_feature_engineering.py` having already built `fact_features`/`fact_ffill` — they don't need scripts 03–09 to have run first, so they can be run any time after step 2 above if you just want to check them in isolation. Scripts 13–15 depend on `04_engineered_model.py`'s trained model/out-of-fold predictions, so run those after script 04.
+Install dependencies first with `pip install -r requirements.txt` (this includes `mapie>=1.0`, needed only by script 15 but included so the whole pipeline installs cleanly in one pass).
 
-**Hardware note:** `04_engineered_model.py` is the most memory-intensive script (35 total XGBoost fits over the full feature set). On machines with <8GB RAM, make sure the float32-downcast fix (§4) is in place, or expect an OOM.
+Scripts 10–12 only depend on `02_feature_engineering.py` having already built `fact_features`/`fact_ffill` — they don't need scripts 03–09 to have run first, so they can be run any time after step 2 if you just want to check them in isolation. Scripts 13–15 depend on `04_engineered_model.py`'s trained model and out-of-fold predictions, so run those after script 04.
 
-**Dependency note:** `15_conformal_prediction.py` requires `mapie>=1.0`, which is not needed by any earlier script. Install with `pip install -r requirements.txt` (now includes `mapie>=1.0`) before running it — a fresh venv that only ran scripts 01–12 will hit `ModuleNotFoundError: No module named 'mapie'` on script 15.
-
----
-
-## 11. Pending work
-
-- Per-subgroup conformal coverage check (§9) — does the 90% guarantee hold uniformly across hospital/age subgroups, or is the "uncertain" flag itself unevenly distributed by site or age the way point-prediction AUROC is?
-- Hospital-specific recalibration or fine-tuning experiment, motivated directly by the §8/§14 cross-hospital generalization results.
-- Final report write-up consolidating §7's results summary and §8's fairness/generalization/uncertainty findings into the DWM/FE submission format.
+For the Power BI half of the OLAP demonstration (importing `outputs/powerbi_export/*.csv` and building the interactive roll-up/drill-down/slice/dice visuals), see `POWERBI_HANDOFF.md`.
