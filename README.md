@@ -225,6 +225,12 @@ The dependence plots below make two of the top relationships concrete:
 
 *Shock index (heart rate ÷ systolic blood pressure) shows a fairly monotonic relationship with SHAP value — as HR climbs relative to SBP (a classic sign of compensated shock), the model's push toward "sepsis" increases smoothly rather than jumping at one cutoff.*
 
+Both plots above are `clinical_ratios` features — composite scores, not raw trend signals. To show what the `slopes_velocity` family (§4, `02_feature_engineering.py`) actually contributes, here's the dependence plot for `HR_slope_6h` (rank #20 by mean |SHAP| — a real but not top-15 feature, included here for what it illustrates rather than for its ranking):
+
+![SHAP dependence: HR slope, 6h](outputs/figures/shap_dependence_HR_slope_6h.png)
+
+*For most of its range, a rising heart rate (`HR_slope_6h > 0`) pushes the prediction toward "sepsis" and a falling or flat heart rate pushes it away — the model has learned that the *direction* a vital is moving matters, not just its current level, which is exactly the motivation for including slope/velocity features at all. The one departure from that pattern is a small cluster of extreme negative slopes (roughly −40 to −45, a heart rate collapsing very fast) sitting back near zero/slightly negative SHAP instead of continuing the downward trend — plausibly a late-stage physiological crash (bradycardic decompensation) that the model has too few examples of to attribute confidently, rather than a sign that rapidly falling HR is reassuring.*
+
 A more surprising finding: two *missingness* features — `Lactate_hours_since_last` (rank 3) and `Bilirubin_total_hours_since_last` (rank 6) — outrank most raw vital-sign features. This validates the missingness-as-signal design decision from script 02: the model is picking up on clinician ordering behavior (more frequent labs when a clinician is worried) as a genuinely useful, if indirect, predictive signal.
 
 Here is what that attribution looks like for one individual, correctly-flagged positive case:
