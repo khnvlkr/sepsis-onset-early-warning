@@ -1,0 +1,45 @@
+
+COMPUTE-CONSTRAINT DISCLOSURE:
+  Full GroupKFold(5) refit-per-fold over all 40,336 patients is not
+  tractable for an O(T^2)-attention Transformer on this machine (7.4GB RAM --
+  the same machine that OOM'd on script 04 and needed subsampling for script
+  16). Training below therefore reuses script 16's exact stratified subsample
+  of n=8,000 patients (seed=42), same 70/15/15
+  train/val/test split by patient, so GRU-D and this Transformer are compared
+  on identical patients as well as both being compared to XGBoost.
+  Sepsis rate -- full population: 0.0727, subsample: 0.0727
+Pulled 307,026 raw patient-hours for 8,000 patients (34 raw vitals/labs, straight from fact_vitals_hourly -- pre-script-02)
+Split: train=5600 val=1200 test=1200 patients
+Train patient-hours: pos=3828 neg=210871 pos_weight=55.1
+Model params: 73,601
+  epoch 01: train_loss=1.1959 train_auroc=0.7195 | val_loss=1.1671 val_auroc=0.7779 val_auprc=0.1255
+  epoch 02: train_loss=1.1580 train_auroc=0.7459 | val_loss=1.1515 val_auroc=0.7874 val_auprc=0.1256
+  epoch 03: train_loss=1.1471 train_auroc=0.7522 | val_loss=1.1900 val_auroc=0.7771 val_auprc=0.1203
+  epoch 04: train_loss=1.1182 train_auroc=0.7740 | val_loss=1.1164 val_auroc=0.8015 val_auprc=0.1153
+  epoch 05: train_loss=1.0977 train_auroc=0.7849 | val_loss=1.1052 val_auroc=0.8033 val_auprc=0.1182
+  epoch 06: train_loss=1.0574 train_auroc=0.8066 | val_loss=1.0895 val_auroc=0.8092 val_auprc=0.1190
+  early stopping at epoch 6 (best val AUPRC=0.1256)
+
+[TEST] Transformer  AUROC=0.7839  AUPRC=0.1032
+[TEST] Transformer best-threshold normalized utility = 0.3227 at threshold=0.62
+
+Mean self-attention weight by relative lag (last encoder layer, averaged over heads/batches/query positions) -- higher = more attended-to distance back in the stay. Complements GRU-D's per-vital decay-rate table (script 16) with a per-*lag* view instead of a per-*vital* one.
+ lag_hours  mean_attention_weight  n_query_positions
+         0               0.107767              46561
+         1               0.080691              45361
+         2               0.069671              44161
+         3               0.063439              42961
+         4               0.058785              41761
+         5               0.054423              40561
+         6               0.050327              39361
+         7               0.046942              38161
+         8               0.044492              36961
+         9               0.042739              35764
+        10               0.041122              34574
+        11               0.039048              33391
+...
+Highest-attended lag: 0h back (recency-biased)
+
+DeLong's test (XGBoost engineered vs Transformer, 46,561 paired predictions, 1,200 patients): AUC 0.7708 -> 0.7839, z=-1.54, p=1.23e-01
+
+DeLong's test (GRU-D vs Transformer, 46,561 paired predictions, 1,200 patients -- same subsample/split, so this comparison is exact, not approximate): AUC 0.7404 -> 0.7839, z=-4.99, p=6.10e-07

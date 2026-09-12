@@ -1,0 +1,48 @@
+ROLL-UP (hourly -> daily): 105,665 rows
+   hospital_id patient_id  day_bucket  ...   avg_Temp  avg_Lactate  sepsis_that_day
+0            1    p000009           3  ...  37.708261     1.300000                0
+1            1    p000009           6  ...  37.703600     1.300000                0
+2            1    p000019           1  ...  36.477826     1.395652                0
+
+[3 rows x 7 columns]
+
+ROLL-UP (daily -> whole stay): 40,336 rows
+   hospital_id patient_id  ...  avg_Lactate_whole_stay  ever_septic
+0            1    p006351  ...                     NaN            1
+1            1    p006363  ...                     1.1            1
+2            1    p006366  ...                     NaN            0
+
+[3 rows x 5 columns]
+DRILL-DOWN level 1 (hospital):
+   hospital_id     avg_HR  n_patients
+0            1  84.889278       20336
+1            2  83.831935       20000
+
+DRILL-DOWN level 2 (patients within hospital 1.0):
+  patient_id      avg_HR  ever_septic
+0    p019000   72.220588            0
+1    p019004  112.905405            0
+2    p019006   63.176471            0
+
+DRILL-DOWN level 3 (hourly detail for patient p019000):
+   hour  HR_ffill  Temp_ffill  Lactate_ffill  SepsisLabel
+0     0       NaN         NaN            NaN            0
+1     1      47.5       35.28            NaN            0
+2     2      55.0       35.78            NaN            0
+3     3      58.5       35.78            NaN            0
+4     4      57.0       35.78            NaN            0
+SLICE (SepsisLabel = 1 only): 27,916 rows
+
+DICE (hospital=1.0 AND septic AND Lactate>2.0): 2,438 rows
+
+Saved OLAP demonstration CSVs to outputs/
+
+Exported Power BI-ready tables to: /home/sash/Downloads/sepsis_capstone/outputs/powerbi_export
+fact_vitals_olap.csv: 1,552,210 rows x 15 cols
+
+Next steps in Power BI Desktop:
+  1. Get Data -> Text/CSV -> import all 3 files from powerbi_export/
+  2. Model view -> drag patient_id (fact -> dim_patient), hospital_id (fact -> dim_hospital)
+  3. Matrix visual: Rows = hospital_id > day_bucket > hour (hierarchy) = rollup/drilldown
+  4. Slicer on hospital_id or SepsisLabel = slice
+  5. Matrix: Rows=hospital_id, Columns=SepsisLabel, Values=avg(shock_index) = dice

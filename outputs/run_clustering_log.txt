@@ -1,0 +1,14 @@
+k=2: silhouette=0.154
+k=3: silhouette=0.117
+k=4: silhouette=0.108
+k=5: silhouette=0.109
+k=6: silhouette=0.087
+k=7: silhouette=0.089
+
+Best k by silhouette: 2
+
+Cluster profile (mean values + sepsis rate):
+           HR_mean    HR_std  O2Sat_mean  O2Sat_std  Temp_mean  Temp_std    SBP_mean    SBP_std   MAP_mean    MAP_std   DBP_mean   DBP_std  Resp_mean  Resp_std     HR_min      HR_max     SBP_min     SBP_max  is_ever_septic  n_patients
+cluster                                                                                                                                                                                                                                   
+0        84.970613  8.125866   97.155517   1.988838  36.888274  0.439706  113.318145  12.131647  76.189548   8.528337  59.074152  6.858934  18.419471  3.476529  70.893165  102.761031   90.212648  139.963124        0.074737       19736
+1        82.217953  8.640220   97.203325   1.832800  36.798760  0.399619  139.943131  16.919836  94.717507  12.210514  72.178279  9.871991  18.405787  3.234575  67.521251  101.693605  107.052506  175.953919        0.070076       12729

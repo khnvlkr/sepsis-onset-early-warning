@@ -1,0 +1,14 @@
+Engineered frame: 1,552,210 rows, 289 features
+  [full_engineered] AUROC=0.7918  AUPRC=0.0821  (n_features=289)
+Best-threshold normalized utility = 0.3203 at threshold=0.50
+
+DeLong's test (baseline vs engineered): AUC 0.7572 -> 0.7918, z=-38.30, p=0.00e+00
+
+Ablation study (single feature family + demographics each time):
+  [ablation:raw_ffill] AUROC=0.7572  AUPRC=0.0634  (n_features=15)
+  [ablation:rolling_stats] AUROC=0.7737  AUPRC=0.0695  (n_features=180)
+  [ablation:slopes_velocity] AUROC=0.7228  AUPRC=0.0557  (n_features=60)
+  [ablation:missingness] AUROC=0.7163  AUPRC=0.0618  (n_features=30)
+  [ablation:clinical_ratios] AUROC=0.6561  AUPRC=0.0379  (n_features=4)
+
+Saved: engineered_results.csv, ablation_results.csv, engineered_oof_predictions.parquet
