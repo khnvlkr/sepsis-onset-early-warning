@@ -1,5 +1,16 @@
 # %% [markdown]
 # # Phase 6 — GRU-D: does a network learn the missingness signal end-to-end?
+# ### (Kaggle notebook version — full dataset, run 2 of 4 in the 04 -> 16 -> 17 -> 18 sequence)
+#
+# **Before running this notebook**, upload a private Kaggle Dataset containing
+# `sepsis.duckdb`, `utility_score.py`, and `delong.py`, attach it via
+# **Notebook > Add Input > Datasets**, and turn on **Settings > Accelerator >
+# GPU T4 x2** (or similar). Paths are auto-detected under `/kaggle/input`.
+# Run this script after 04 — it optionally uses 04's `engineered_oof_predictions.parquet`
+# for the vs-XGBoost DeLong comparison, found automatically under
+# `/kaggle/working/outputs` if both scripts run in the same session, or under
+# the attached dataset otherwise. Script 17 and 18 depend on this script's
+# outputs in turn (18 needs `grud_test_predictions.parquet`).
 #
 # Script 02 hand-computed `{vital}_hours_since_last` in SQL as a missingness
 # feature. Script 05's SHAP analysis then found that one of those hand-built
@@ -31,17 +42,19 @@
 # deliberately, since the whole point is that the network should learn decay
 # itself rather than being handed script 02's `_hours_since_last` columns.
 #
-# EVALUATION PROTOCOL DISCLOSURE (same spirit as 09_hierarchical_clustering.py):
-# A full `GroupKFold(5)` over all ~40,336 patients, refit per fold, is not
-# laptop-tractable for a recurrent model trained with backprop-through-time
-# (this is the same 7.4GB RAM machine that OOM'd on script 04's ablation
-# loop). This script instead trains on a stratified random subsample of
-# `N_SUBSAMPLE_PATIENTS` patients (seed=42, stratified on `is_ever_septic`,
-# same subsampling helper as 09), split 70/15/15 train/val/test by patient
-# (GRU-D needs a held-out validation set for early stopping, which XGBoost's
-# k-fold CV doesn't need). Increase N_SUBSAMPLE_PATIENTS if your machine has
-# more headroom; the disclosure and manifest below make the choice explicit
-# either way.
+# EVALUATION PROTOCOL — Kaggle full-dataset version:
+# The local version of this script disclosed that a full `GroupKFold(5)`
+# over all ~40,336 patients, refit per fold, was not tractable for a
+# recurrent BPTT model on an 7.4GB-RAM laptop, and trained on a stratified
+# subsample of N_SUBSAMPLE_PATIENTS=20,000 instead. On Kaggle (GPU +
+# considerably more RAM), that constraint doesn't apply the same way, so
+# this version sets N_SUBSAMPLE_PATIENTS = None to use the FULL population
+# of patients, still split 70/15/15 train/val/test by patient (GRU-D still
+# needs a held-out validation set for early stopping, which XGBoost's
+# k-fold CV in scripts 03/04 doesn't need) and still stratified on
+# `is_ever_septic` for the split itself. Script 18 (Transformer) mirrors
+# this same full-population choice so the two sequence models remain
+# trained/evaluated on identical patients.
 
 # %%
 import gc
@@ -63,30 +76,64 @@ try:
     from torch.utils.data import Dataset, DataLoader
 except ImportError:
     sys.exit(
-        "PyTorch is required for this script and isn't in requirements.txt yet "
-        "(the rest of the pipeline is XGBoost/sklearn/duckdb only).\n"
-        "  pip install torch --index-url https://download.pytorch.org/whl/cpu\n"
-        "CPU is enough here -- small model, subsampled patients."
+        "PyTorch is required for this script. On Kaggle it's preinstalled --\n"
+        "if this fires anyway, check Settings > Environment."
     )
 
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score, average_precision_score
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+# ---- Kaggle paths ---------------------------------------------------------
+# Same auto-detection convention as 17_tabnet_model_kaggle.py: search for
+# sepsis.duckdb under /kaggle/input rather than hardcoding a dataset slug,
+# since Kaggle's exact attached-dataset nesting has changed before.
+KAGGLE_ROOT = Path("/kaggle/input")
+_candidates = sorted(KAGGLE_ROOT.glob("**/sepsis.duckdb"))
+if not _candidates:
+    sys.exit(
+        f"Couldn't find sepsis.duckdb anywhere under {KAGGLE_ROOT}.\n"
+        f"Check that your Kaggle Dataset (containing sepsis.duckdb, "
+        f"utility_score.py, delong.py, etc.) is attached via "
+        f"Notebook > Add Input > Datasets."
+    )
+if len(_candidates) > 1:
+    print(f"Warning: found {len(_candidates)} sepsis.duckdb files under {KAGGLE_ROOT}, "
+          f"using the first one: {_candidates[0]}")
+DB_PATH = _candidates[0]
+KAGGLE_INPUT_DIR = DB_PATH.parent
+OUT_DIR = Path("/kaggle/working/outputs")
+FIG_DIR = OUT_DIR / "figures"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+FIG_DIR.mkdir(parents=True, exist_ok=True)
+print(f"Using dataset directory: {KAGGLE_INPUT_DIR}")
+
+sys.path.insert(0, str(KAGGLE_INPUT_DIR))
 from utility_score import normalized_utility_score, sweep_thresholds_for_utility
 from delong import delong_roc_test, delong_ci_line
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DB_PATH = PROJECT_ROOT / "warehouse" / "sepsis.duckdb"
-OUT_DIR = PROJECT_ROOT / "outputs"
-FIG_DIR = OUT_DIR / "figures"
-OUT_DIR.mkdir(exist_ok=True)
-FIG_DIR.mkdir(exist_ok=True)
+
+def find_prior_output(filename):
+    """Look for another script's output first in this session's own working
+    outputs (if it already ran earlier in this same Kaggle session -- e.g.
+    script 04 immediately before this one), then fall back to the attached
+    input dataset (if it was produced in an earlier, separate Kaggle run)."""
+    for candidate in (OUT_DIR / filename, KAGGLE_INPUT_DIR / filename):
+        if candidate.exists():
+            return candidate
+    return None
+
+
+print(f"[16_grud_model_kaggle] torch device: {torch.device('cuda' if torch.cuda.is_available() else 'cpu')}"
+      + ("" if torch.cuda.is_available() else
+         "  -- no GPU detected. On Kaggle: Notebook Settings > Accelerator > "
+         "GPU T4 x2 (or similar), then re-run. This script trains via backprop "
+         "over the full patient population and benefits a lot from a GPU."))
 
 # ---- config -----------------------------------------------------------------
-N_SUBSAMPLE_PATIENTS = 20000     # bumped from 8,000 -- targeted power increase for the vs-XGBoost/
-                                  # vs-Transformer DeLong comparisons; still not full-population,
-                                  # still single 70/15/15 split (see script 18's matching change)
+N_SUBSAMPLE_PATIENTS = None      # None = use the FULL patient population (Kaggle has the RAM/
+                                  # GPU headroom the local 7.4GB-RAM machine didn't); the local
+                                  # version subsampled to 20,000 for laptop tractability (see
+                                  # script 18's matching change to stay comparable)
 MAX_SEQ_LEN = 336               # PhysioNet 2019 max ICULOS
 RANDOM_STATE = 42               # matches every other script's RANDOM_STATE/seed
 BATCH_SIZE = 64
@@ -139,17 +186,31 @@ def load_patient_subsample(con):
     patients = con.execute(
         "SELECT patient_id, is_ever_septic FROM dim_patient"
     ).df()
-    sub = stratified_subsample(patients, N_SUBSAMPLE_PATIENTS, RANDOM_STATE)
-    log(
-        f"\nEVALUATION PROTOCOL DISCLOSURE:\n"
-        f"  Full GroupKFold(5) refit-per-fold over all {len(patients):,} patients is not\n"
-        f"  tractable for a BPTT-trained recurrent model on this machine (7.4GB RAM --\n"
-        f"  the same machine that OOM'd on script 04). Training below therefore runs on\n"
-        f"  a stratified random subsample of n={N_SUBSAMPLE_PATIENTS:,} patients (seed=\n"
-        f"  {RANDOM_STATE}), stratified on is_ever_septic, split 70/15/15 train/val/test\n"
-        f"  by patient. This mirrors the disclosed subsampling precedent already set by\n"
-        f"  09_hierarchical_clustering.py."
-    )
+    if N_SUBSAMPLE_PATIENTS is None:
+        # Full population, still shuffled (frac=1.0 sample) rather than
+        # taken in table order, and still seeded, for parity with the
+        # subsampled path's determinism.
+        sub = stratified_subsample(patients, len(patients), RANDOM_STATE)
+        log(
+            f"\nFULL-DATASET RUN (Kaggle): training on all {len(patients):,} patients -- "
+            f"no subsampling. The local version of this script disclosed a stratified\n"
+            f"  subsample of n=20,000 patients as a laptop-RAM tractability workaround\n"
+            f"  (7.4GB RAM machine that OOM'd on script 04); that constraint doesn't apply\n"
+            f"  on Kaggle, so this run uses the full population, split 70/15/15\n"
+            f"  train/val/test by patient (stratified on is_ever_septic)."
+        )
+    else:
+        sub = stratified_subsample(patients, N_SUBSAMPLE_PATIENTS, RANDOM_STATE)
+        log(
+            f"\nEVALUATION PROTOCOL DISCLOSURE:\n"
+            f"  Full GroupKFold(5) refit-per-fold over all {len(patients):,} patients is not\n"
+            f"  tractable for a BPTT-trained recurrent model on this machine (7.4GB RAM --\n"
+            f"  the same machine that OOM'd on script 04). Training below therefore runs on\n"
+            f"  a stratified random subsample of n={N_SUBSAMPLE_PATIENTS:,} patients (seed=\n"
+            f"  {RANDOM_STATE}), stratified on is_ever_septic, split 70/15/15 train/val/test\n"
+            f"  by patient. This mirrors the disclosed subsampling precedent already set by\n"
+            f"  09_hierarchical_clustering.py."
+        )
     log(f"  Sepsis rate -- full population: {patients['is_ever_septic'].mean():.4f}, "
         f"subsample: {sub['is_ever_septic'].mean():.4f}")
     return sub["patient_id"].tolist()
@@ -362,6 +423,23 @@ def run_grud():
                 break
 
     model.load_state_dict(best_state)
+
+    # --- val-set predictions, from the SAME best_state used for test -----
+    # Saved to disk (unlike before) for two downstream uses that must NOT
+    # touch the test set: (a) post-hoc Platt-scaling calibration (script 19),
+    # (b) picking the alarm operating threshold below. Neither the
+    # calibrator nor the threshold may be fit/chosen on test data.
+    _, val_auroc_final, val_auprc_final, val_probs, val_labels = run_epoch(
+        model, val_loader, optimizer, pos_weight, train=False
+    )
+    val_pids = np.concatenate([[s["patient_id"]] * len(s["labels"]) for s in val_seqs])
+    val_hours = np.concatenate([s["hour"] for s in val_seqs])
+    val_eval_df = pd.DataFrame({
+        "patient_id": val_pids, "hour": val_hours,
+        "SepsisLabel": val_labels.astype(int), "grud_proba": val_probs,
+    })
+    log(f"[VAL, best checkpoint] GRU-D  AUROC={val_auroc_final:.4f}  AUPRC={val_auprc_final:.4f}")
+
     _, test_auroc, test_auprc, test_probs, test_labels = run_epoch(model, test_loader, optimizer, pos_weight, train=False)
     log(f"\n[TEST] GRU-D  AUROC={test_auroc:.4f}  AUPRC={test_auprc:.4f}")
 
@@ -374,12 +452,23 @@ def run_grud():
         "SepsisLabel": test_labels.astype(int), "grud_proba": test_probs,
     })
 
+    # --- threshold LOCKED on val, then applied once to test (not swept on
+    #     test) -- see script 19's methodology note on why the previous
+    #     version (sweeping on eval_df/test directly) was a leak: it let the
+    #     test set influence the very decision rule then evaluated on it. ---
     thr_table = sweep_thresholds_for_utility(
-        eval_df, patient_col="patient_id", label_col="SepsisLabel", proba_col="grud_proba"
+        val_eval_df, patient_col="patient_id", label_col="SepsisLabel", proba_col="grud_proba"
     )
     best_row = thr_table.iloc[0]
-    log(f"[TEST] GRU-D best-threshold normalized utility = {best_row.normalized_utility:.4f} "
-        f"at threshold={best_row.threshold:.2f}")
+    locked_threshold = float(best_row.threshold)
+    test_utility_at_locked_threshold = normalized_utility_score(
+        eval_df, patient_col="patient_id", label_col="SepsisLabel",
+        proba_col="grud_proba", threshold=locked_threshold,
+    )
+    log(f"[VAL] GRU-D best-threshold normalized utility = {best_row.normalized_utility:.4f} "
+        f"at threshold={locked_threshold:.2f} (selected on val, NOT test)")
+    log(f"[TEST] GRU-D normalized utility at the VAL-locked threshold={locked_threshold:.2f}: "
+        f"{test_utility_at_locked_threshold:.4f}")
 
     # --- interpretability: did the network learn what script 02/05 found by hand? ---
     log("\nMean learned input-decay rate gamma_x per vital (lower = network decays "
@@ -408,13 +497,17 @@ def run_grud():
     # --- DeLong's test vs XGBoost engineered model (script 04's OOF predictions) ---
     results_row = {
         "model": "grud", "auroc": test_auroc, "auprc": test_auprc,
-        "best_threshold": best_row.threshold, "normalized_utility": best_row.normalized_utility,
-        "n_features": len(RAW_VITALS), "n_subsample_patients": N_SUBSAMPLE_PATIENTS,
+        "best_threshold": locked_threshold,
+        "normalized_utility": test_utility_at_locked_threshold,
+        "val_normalized_utility_at_threshold": best_row.normalized_utility,
+        "threshold_selection": "locked on val, applied once to test",
+        "n_features": len(RAW_VITALS),
+        "n_subsample_patients": N_SUBSAMPLE_PATIENTS if N_SUBSAMPLE_PATIENTS is not None else len(patient_ids),
         "n_train_patients": len(train_ids), "n_val_patients": len(val_ids),
         "n_test_patients": len(test_ids), "epochs_run": epoch,
     }
-    engineered_path = OUT_DIR / "engineered_oof_predictions.parquet"
-    if engineered_path.exists():
+    engineered_path = find_prior_output("engineered_oof_predictions.parquet")
+    if engineered_path is not None:
         xgb_df = pd.read_parquet(engineered_path)
         merged = eval_df.merge(
             xgb_df[["patient_id", "hour", "engineered_proba"]], on=["patient_id", "hour"], how="inner"
@@ -434,15 +527,17 @@ def run_grud():
         results_row["ci_lower"] = ci_lo
         results_row["ci_upper"] = ci_hi
     else:
-        log(f"\n(No {engineered_path.name} found -- run 04_engineered_model.py first "
+        log(f"\n(No engineered_oof_predictions.parquet found in /kaggle/working/outputs "
+            f"or the attached input dataset -- run 04_engineered_model_kaggle.py first "
             f"to get the DeLong comparison against XGBoost.)")
 
     pd.DataFrame([results_row]).to_csv(OUT_DIR / "grud_results.csv", index=False)
     eval_df.rename(columns={"SepsisLabel": "SepsisLabel"}).to_parquet(OUT_DIR / "grud_test_predictions.parquet")
+    val_eval_df.to_parquet(OUT_DIR / "grud_val_predictions.parquet")
     with open(OUT_DIR / "run16_log.txt", "w") as f:
         f.write("\n".join(log_lines))
-    log(f"\nSaved: grud_results.csv, grud_test_predictions.parquet, grud_decay_rates.csv, "
-        f"run16_log.txt ({time.time() - t0:.1f}s total)")
+    log(f"\nSaved: grud_results.csv, grud_test_predictions.parquet, grud_val_predictions.parquet, "
+        f"grud_decay_rates.csv, run16_log.txt ({time.time() - t0:.1f}s total)")
     return results_row
 
 

@@ -1,0 +1,6 @@
+model,n_features,architecture,n_params_or_leaves,total_wall_clock,measurement_note
+baseline (XGBoost),15,"300 trees, max_depth=5",not captured (model not saved to disk),"not logged -- script 03 has no timer, no run03_log.txt saved",needs instrumentation
+engineered (XGBoost),289,"300 trees, max_depth=5",not captured (model not saved to disk),"not logged -- script 04 has no timer at all, no run04_log.txt saved",needs instrumentation
+TabNet,289,"n_d=16, n_a=16, n_steps=3, gamma=1.5 (5-fold CV)",not captured (would need pytorch_tabnet model.network.parameters()),"1,467s = 24.5 min (35.8s load + 1,431.6s summed fold timings) -- fully logged, computed from run17_log.txt",measured exactly
+GRU-D,34,"hidden_size=64, single GRUCell layer, 13 epochs (early stop)","29,223 (hand-derived from architecture: gamma_x_lin + gamma_h_lin + GRUCell + head; not printed by the script)","not recoverable -- script DOES time itself (t0=time.time(), final print), but that last line is missing from the saved run16_log.txt",script has timer; final log line lost
+Transformer,34,"73,601 params (self-logged), 8 epochs (early stop)","73,601 (directly logged by the script)","not recoverable -- same issue as GRU-D, final timing line missing from run18_log.txt",script has timer; final log line lost

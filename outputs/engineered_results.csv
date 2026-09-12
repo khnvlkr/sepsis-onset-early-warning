@@ -1,2 +1,2 @@
-model,auroc,auprc,best_threshold,normalized_utility,n_features,auc_a,auc_b,auc_diff,z,p_value
-engineered_full,0.7918489251770355,0.08205526746933435,0.5,0.3202890801727466,289,0.7571900029263884,0.7918489251770355,-0.03465892225064715,-38.299492748692394,0.0
+model,auroc,auprc,best_threshold,normalized_utility,n_features
+engineered_full,0.7925582422198258,0.08339544304040997,0.5,0.3201900173330619,289

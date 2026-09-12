@@ -1,10 +1,34 @@
 # %% [markdown]
 # # Phase 5 — Engineered-feature model vs. baseline
+# ### (Kaggle notebook version — full dataset, run 1 of 4 in the 04 -> 16 -> 17 -> 18 sequence)
 #
-# Same patient-grouped folds as the baseline (rebuilt identically via the
-# same GroupKFold call + random_state, so the comparison is apples-to-apples)
-# but trained on the full `fact_features` table: rolling stats, slopes,
-# missingness-as-signal, clinical ratios.
+# **Before running this notebook**, upload a private Kaggle Dataset containing:
+#   - `sepsis.duckdb` (the warehouse built by `01_etl_warehouse.py` + `02_feature_engineering.py`)
+#   - `utility_score.py` and `delong.py` (copied as-is from `src/` — imported
+#     straight from the dataset directory, no separate upload step needed)
+#   - `baseline_oof_predictions.parquet` (from `03_baseline_model.py`, optional —
+#     only needed for the DeLong's-test comparison against the baseline model)
+#
+# Then attach that dataset to this notebook (**Notebook > Add Input > Datasets**)
+# before running. Paths are auto-detected below by searching for
+# `sepsis.duckdb` under `/kaggle/input`, so there's no dataset-name variable
+# to set by hand. GPU is not required for XGBoost (`tree_method="hist"` runs
+# fine on CPU), but leaving an accelerator on doesn't hurt.
+#
+# This is script 1 of 4 in the "re-run with full datasets" sequence
+# (04 -> 16 -> 17 -> 18). Run this one first in a Kaggle session — its
+# `engineered_oof_predictions.parquet` output is a required input for
+# scripts 16, 17, and 18's DeLong comparisons against XGBoost. If you run
+# all four scripts in the same notebook/session, later scripts will find
+# this script's outputs automatically under `/kaggle/working/outputs`; if
+# you run them as separate sessions instead, copy this script's outputs
+# into the Kaggle Dataset the later scripts attach as input.
+#
+# Otherwise unchanged from the local version: same leakage-safe
+# patient-grouped GroupKFold(5), same utility metric, same DeLong's-test
+# helper, same full `fact_features` table (this script never subsampled —
+# unlike scripts 16/17/18, XGBoost's tree splits made the full 1.55M-row
+# table tractable on a laptop already).
 
 # %%
 import duckdb
@@ -17,14 +41,46 @@ from sklearn.metrics import roc_auc_score, average_precision_score
 import sys
 import gc 
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+import warnings
+warnings.filterwarnings("ignore")
+
+# ---- Kaggle paths ---------------------------------------------------------
+# Same auto-detection convention as 17_tabnet_model_kaggle.py: search for
+# sepsis.duckdb under /kaggle/input rather than hardcoding a dataset slug,
+# since Kaggle's exact attached-dataset nesting has changed before.
+KAGGLE_ROOT = Path("/kaggle/input")
+_candidates = sorted(KAGGLE_ROOT.glob("**/sepsis.duckdb"))
+if not _candidates:
+    sys.exit(
+        f"Couldn't find sepsis.duckdb anywhere under {KAGGLE_ROOT}.\n"
+        f"Check that your Kaggle Dataset (containing sepsis.duckdb, "
+        f"utility_score.py, delong.py, etc.) is attached via "
+        f"Notebook > Add Input > Datasets."
+    )
+if len(_candidates) > 1:
+    print(f"Warning: found {len(_candidates)} sepsis.duckdb files under {KAGGLE_ROOT}, "
+          f"using the first one: {_candidates[0]}")
+DB_PATH = _candidates[0]
+KAGGLE_INPUT_DIR = DB_PATH.parent
+OUT_DIR = Path("/kaggle/working/outputs")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+print(f"Using dataset directory: {KAGGLE_INPUT_DIR}")
+
+sys.path.insert(0, str(KAGGLE_INPUT_DIR))
 from utility_score import normalized_utility_score, sweep_thresholds_for_utility
 from delong import delong_roc_test
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DB_PATH = PROJECT_ROOT / "warehouse" / "sepsis.duckdb"
-OUT_DIR = PROJECT_ROOT / "outputs"
-OUT_DIR.mkdir(exist_ok=True)
+
+def find_prior_output(filename):
+    """Look for another script's output first in this session's own working
+    outputs (if it already ran earlier in this same Kaggle session), then
+    fall back to the attached input dataset (if it was produced in an
+    earlier, separate Kaggle run and included in the dataset)."""
+    for candidate in (OUT_DIR / filename, KAGGLE_INPUT_DIR / filename):
+        if candidate.exists():
+            return candidate
+    return None
+
 
 N_FOLDS = 5
 RANDOM_STATE = 42  # must match 03_baseline_model.py so folds line up
@@ -125,9 +181,9 @@ def run_engineered():
           f"at threshold={best_row.threshold:.2f}")
 
     # --- compare against baseline via DeLong's test ---
-    baseline_path = OUT_DIR / "baseline_oof_predictions.parquet"
+    baseline_path = find_prior_output("baseline_oof_predictions.parquet")
     comparison_row = {}
-    if baseline_path.exists():
+    if baseline_path is not None:
         base = pd.read_parquet(baseline_path)
         merged = df[["patient_id", "hour", "SepsisLabel", "engineered_proba"]].merge(
             base[["patient_id", "hour", "baseline_proba"]], on=["patient_id", "hour"], how="inner"
@@ -142,8 +198,9 @@ def run_engineered():
               f"z={test_result['z']:.2f}, p={test_result['p_value']:.2e}")
         comparison_row = test_result
     else:
-        print("\n(No baseline_oof_predictions.parquet found — run 03_baseline_model.py "
-              "first to get the DeLong comparison.)")
+        print("\n(No baseline_oof_predictions.parquet found in /kaggle/working/outputs "
+              "or the attached input dataset — run 03_baseline_model.py first, or add its "
+              "output to the dataset, to get the DeLong comparison.)")
 
     # --- ablation: train on one feature family at a time ---
     print("\nAblation study (single feature family + demographics each time):")

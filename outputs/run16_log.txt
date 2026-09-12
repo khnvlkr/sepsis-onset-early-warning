@@ -1,75 +1,70 @@
 
-COMPUTE-CONSTRAINT DISCLOSURE:
-  Full GroupKFold(5) refit-per-fold over all 40,336 patients is not
-  tractable for a BPTT-trained recurrent model on this machine (7.4GB RAM --
-  the same machine that OOM'd on script 04). Training below therefore runs on
-  a stratified random subsample of n=20,000 patients (seed=
-  42), stratified on is_ever_septic, split 70/15/15 train/val/test
-  by patient. This mirrors the disclosed subsampling precedent already set by
-  09_hierarchical_clustering.py.
+FULL-DATASET RUN (Kaggle): training on all 40,336 patients -- no subsampling. The local version of this script disclosed a stratified
+  subsample of n=20,000 patients as a laptop-RAM tractability workaround
+  (7.4GB RAM machine that OOM'd on script 04); that constraint doesn't apply
+  on Kaggle, so this run uses the full population, split 70/15/15
+  train/val/test by patient (stratified on is_ever_septic).
   Sepsis rate -- full population: 0.0727, subsample: 0.0727
-Pulled 767,710 raw patient-hours for 20,000 patients (34 raw vitals/labs, straight from fact_vitals_hourly -- pre-script-02)
-Split: train=14000 val=3000 test=3000 patients
-Train patient-hours: pos=9845 neg=528636 pos_weight=53.7
-  epoch 01: train_loss=1.3107 train_auroc=0.6352 | val_loss=1.2324 val_auroc=0.7002 val_auprc=0.0437
-  epoch 02: train_loss=1.2531 train_auroc=0.7028 | val_loss=1.2025 val_auroc=0.7167 val_auprc=0.0566
-  epoch 03: train_loss=1.2412 train_auroc=0.7034 | val_loss=1.1803 val_auroc=0.7246 val_auprc=0.0595
-  epoch 04: train_loss=1.2146 train_auroc=0.7196 | val_loss=1.1852 val_auroc=0.7456 val_auprc=0.0572
-  epoch 05: train_loss=1.1998 train_auroc=0.7321 | val_loss=1.1333 val_auroc=0.7547 val_auprc=0.0624
-  epoch 06: train_loss=1.1943 train_auroc=0.7358 | val_loss=1.1321 val_auroc=0.7604 val_auprc=0.0608
-  epoch 07: train_loss=1.1930 train_auroc=0.7390 | val_loss=1.1397 val_auroc=0.7558 val_auprc=0.0639
-  epoch 08: train_loss=1.1762 train_auroc=0.7458 | val_loss=1.1247 val_auroc=0.7601 val_auprc=0.0651
-  epoch 09: train_loss=1.1622 train_auroc=0.7531 | val_loss=1.1432 val_auroc=0.7436 val_auprc=0.0599
-  epoch 10: train_loss=1.1606 train_auroc=0.7545 | val_loss=1.1436 val_auroc=0.7496 val_auprc=0.0686
-  epoch 11: train_loss=1.1644 train_auroc=0.7517 | val_loss=1.1287 val_auroc=0.7553 val_auprc=0.0649
-  epoch 12: train_loss=1.1574 train_auroc=0.7563 | val_loss=1.1474 val_auroc=0.7530 val_auprc=0.0714
-  epoch 13: train_loss=1.1620 train_auroc=0.7540 | val_loss=1.1329 val_auroc=0.7643 val_auprc=0.0682
-  epoch 14: train_loss=1.1656 train_auroc=0.7523 | val_loss=1.1333 val_auroc=0.7683 val_auprc=0.0683
-  epoch 15: train_loss=1.1696 train_auroc=0.7494 | val_loss=1.1254 val_auroc=0.7641 val_auprc=0.0671
-  epoch 16: train_loss=1.1594 train_auroc=0.7551 | val_loss=1.1835 val_auroc=0.7545 val_auprc=0.0673
-  early stopping at epoch 16 (best val AUPRC=0.0714)
+Pulled 1,552,210 raw patient-hours for 40,336 patients (34 raw vitals/labs, straight from fact_vitals_hourly -- pre-script-02)
+Split: train=28235 val=6050 test=6051 patients
+Train patient-hours: pos=19671 neg=1066749 pos_weight=54.2
+  epoch 01: train_loss=1.2862 train_auroc=0.6729 | val_loss=1.2242 val_auroc=0.7382 val_auprc=0.0532
+  epoch 02: train_loss=1.2240 train_auroc=0.7166 | val_loss=1.2084 val_auroc=0.7451 val_auprc=0.0623
+  epoch 03: train_loss=1.1948 train_auroc=0.7340 | val_loss=1.1427 val_auroc=0.7561 val_auprc=0.0601
+  epoch 04: train_loss=1.1791 train_auroc=0.7409 | val_loss=1.1383 val_auroc=0.7608 val_auprc=0.0706
+  epoch 05: train_loss=1.1759 train_auroc=0.7443 | val_loss=1.1387 val_auroc=0.7638 val_auprc=0.0663
+  epoch 06: train_loss=1.1607 train_auroc=0.7530 | val_loss=1.1451 val_auroc=0.7644 val_auprc=0.0717
+  epoch 07: train_loss=1.1777 train_auroc=0.7404 | val_loss=1.1275 val_auroc=0.7777 val_auprc=0.0706
+  epoch 08: train_loss=1.1532 train_auroc=0.7565 | val_loss=1.1516 val_auroc=0.7674 val_auprc=0.0668
+  epoch 09: train_loss=1.1767 train_auroc=0.7422 | val_loss=1.1292 val_auroc=0.7742 val_auprc=0.0761
+  epoch 10: train_loss=1.1611 train_auroc=0.7535 | val_loss=1.1306 val_auroc=0.7923 val_auprc=0.0751
+  epoch 11: train_loss=1.1441 train_auroc=0.7607 | val_loss=1.1168 val_auroc=0.7796 val_auprc=0.0722
+  epoch 12: train_loss=1.1351 train_auroc=0.7686 | val_loss=1.1060 val_auroc=0.7805 val_auprc=0.0723
+  epoch 13: train_loss=1.1424 train_auroc=0.7627 | val_loss=1.1089 val_auroc=0.7812 val_auprc=0.0679
+  early stopping at epoch 13 (best val AUPRC=0.0761)
+[VAL, best checkpoint] GRU-D  AUROC=0.7742  AUPRC=0.0761
 
-[TEST] GRU-D  AUROC=0.7605  AUPRC=0.0661
-[TEST] GRU-D best-threshold normalized utility = 0.2854 at threshold=0.50
+[TEST] GRU-D  AUROC=0.7387  AUPRC=0.0591
+[VAL] GRU-D best-threshold normalized utility = 0.3243 at threshold=0.62 (selected on val, NOT test)
+[TEST] GRU-D normalized utility at the VAL-locked threshold=0.62: 0.2374
 
 Mean learned input-decay rate gamma_x per vital (lower = network decays that vital's stale readings faster -- treats freshness as more urgent). Compare against script 05's SHAP ranking of *_hours_since_last (Lactate #3, Bilirubin_total #6 model-wide).
            vital  mean_gamma_x
-       Platelets      0.032971
-            FiO2      0.033767
-       Phosphate      0.034752
-         Glucose      0.038801
-           EtCO2      0.054656
-             DBP      0.056677
-              pH      0.060689
-      Creatinine      0.167563
-      Fibrinogen      0.334955
-    Alkalinephos      0.345143
-             MAP      0.387072
-            HCO3      0.671140
-Bilirubin_direct      0.870195
-         Calcium      0.899422
-             Hct      0.966303
-            SaO2      0.991449
-            Resp      0.991819
-             AST      0.997209
-              HR      0.998213
-             BUN      0.998786
-        Chloride      0.998881
-             SBP      0.998974
-       TroponinI      0.999497
-           O2Sat      0.999551
-       Magnesium      0.999658
-           PaCO2      0.999778
-             PTT      0.999874
-             WBC      0.999896
- Bilirubin_total      0.999918
-             Hgb      0.999997
+         Glucose      0.028899
+             Hct      0.030826
+    Alkalinephos      0.031451
+       Platelets      0.031801
+           EtCO2      0.055326
+         Calcium      0.062259
+            SaO2      0.067528
+             DBP      0.174675
+             AST      0.293824
+      Creatinine      0.571918
+      Fibrinogen      0.971881
+           O2Sat      0.988968
+Bilirubin_direct      0.989515
+             MAP      0.997952
+              HR      0.998055
+           PaCO2      0.998303
+            HCO3      0.998867
+            Resp      0.999038
+       Magnesium      0.999523
+        Chloride      0.999538
+              pH      0.999549
+             SBP      0.999874
+ Bilirubin_total      0.999901
+       TroponinI      0.999925
+             BUN      0.999936
+       Phosphate      0.999969
+         Lactate      0.999974
+             WBC      0.999992
       BaseExcess      1.000000
-            Temp      1.000000
        Potassium      1.000000
-         Lactate      1.000000
-  Lactate: rank #34/34 by fastest learned decay (SHAP had its hours_since_last feature at #3 model-wide)
-  Bilirubin_total: rank #29/34 by fastest learned decay (SHAP had its hours_since_last feature at #6 model-wide)
+            Temp      1.000000
+            FiO2      1.000000
+             PTT      1.000000
+             Hgb      1.000000
+  Lactate: rank #27/34 by fastest learned decay (SHAP had its hours_since_last feature at #3 model-wide)
+  Bilirubin_total: rank #23/34 by fastest learned decay (SHAP had its hours_since_last feature at #6 model-wide)
 
-DeLong's test (XGBoost engineered vs GRU-D, 114,486 paired predictions, 3,000 patients): AUC 0.7923 -> 0.7605, z=6.03, p=1.65e-09
-vs XGBoost: ΔAUC = +0.0318 (95% CI: +0.0215 to +0.0422), p=1.65e-09 (significant)
+(No engineered_oof_predictions.parquet found in /kaggle/working/outputs or the attached input dataset -- run 04_engineered_model_kaggle.py first to get the DeLong comparison against XGBoost.)

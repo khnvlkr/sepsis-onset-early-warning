@@ -1,37 +1,41 @@
-Engineered frame: 545,863 rows, 289 features (same fact_features table as 04_engineered_model.py) [loaded in 19.9s]
-  [timing] split=0.0s  nanmedian=1.2s  impute_scale=2.7s
-  fold 0: AUROC=0.7291  AUPRC=0.0573  (train=11,326 pts / test=2,831 pts)
-  [timing] split=0.0s  nanmedian=1.2s  impute_scale=2.6s
-  fold 1: AUROC=0.7082  AUPRC=0.0532  (train=11,326 pts / test=2,831 pts)
-  [timing] split=0.0s  nanmedian=1.2s  impute_scale=2.7s
-  fold 2: AUROC=0.7084  AUPRC=0.0572  (train=11,325 pts / test=2,832 pts)
-  [timing] split=0.0s  nanmedian=1.2s  impute_scale=2.6s
-  fold 3: AUROC=0.7094  AUPRC=0.0614  (train=11,325 pts / test=2,832 pts)
-  [timing] split=0.0s  nanmedian=1.1s  impute_scale=2.6s
-  fold 4: AUROC=0.7123  AUPRC=0.0590  (train=11,326 pts / test=2,831 pts)
+Engineered frame: 1,552,210 rows, 289 features (same fact_features table as 04_engineered_model.py) [loaded in 35.8s]
+  [timing] split=0.0s  nanmedian=4.6s  impute_scale=7.7s
+  [timing] fit=258.2s  predict=3.9s  feature_importances(n=105,602)=8.2s  cleanup=0.1s
+  fold 0: AUROC=0.7617  AUPRC=0.0601  (train=32,269 pts / test=8,067 pts)
+  [timing] split=0.0s  nanmedian=4.5s  impute_scale=7.7s
+  [timing] fit=255.9s  predict=3.9s  feature_importances(n=105,634)=8.1s  cleanup=0.1s
+  fold 1: AUROC=0.7609  AUPRC=0.0679  (train=32,269 pts / test=8,067 pts)
+  [timing] split=0.0s  nanmedian=4.5s  impute_scale=7.6s
+  [timing] fit=256.5s  predict=3.8s  feature_importances(n=105,305)=8.3s  cleanup=0.1s
+  fold 2: AUROC=0.7640  AUPRC=0.0662  (train=32,268 pts / test=8,068 pts)
+  [timing] split=0.0s  nanmedian=4.5s  impute_scale=7.6s
+  [timing] fit=282.5s  predict=3.9s  feature_importances(n=105,850)=8.1s  cleanup=0.1s
+  fold 3: AUROC=0.7633  AUPRC=0.0696  (train=32,269 pts / test=8,067 pts)
+  [timing] split=0.0s  nanmedian=4.5s  impute_scale=7.6s
+  [timing] fit=257.0s  predict=3.7s  feature_importances(n=105,527)=8.3s  cleanup=0.1s
+  fold 4: AUROC=0.7534  AUPRC=0.0584  (train=32,269 pts / test=8,067 pts)
 
-[TEST] TabNet OOF AUROC=0.7089  AUPRC=0.0560  (n_features=289)
-Best-threshold normalized utility = 0.2123 at threshold=0.54
+[TEST] TabNet OOF AUROC=0.7597  AUPRC=0.0640  (n_features=289)
+Best-threshold normalized utility = 0.2687 at threshold=0.58
 
-DeLong's test (XGBoost engineered vs TabNet, 545,863 paired predictions, 14,157 patients): AUC 0.7848 -> 0.7089, z=30.62, p=0.00e+00
+DeLong's test (XGBoost engineered vs TabNet, 1,552,210 paired predictions, 40,336 patients): AUC 0.7926 -> 0.7597, z=31.07, p=0.00e+00
 
 Top 15 features by mean TabNet attention-mask importance (averaged across 5 folds):
                          feature  tabnet_importance
-Bilirubin_total_hours_since_last           0.127712
-        Lactate_hours_since_last           0.121687
-                    Temp_mean_6h           0.091170
-                   Resp_mean_12h           0.035852
-                     Temp_max_3h           0.025686
-                      SBP_min_6h           0.021931
-                      MAP_min_3h           0.021357
-                      BUN_max_6h           0.020689
-                 Lactate_missing           0.018818
-                      HR_mean_6h           0.017569
-                      HR_mean_3h           0.017380
-                     WBC_mean_3h           0.015647
-                Platelets_std_6h           0.014335
-                      MAP_min_6h           0.014223
-                    Temp_mean_3h           0.011636
+        Lactate_hours_since_last           0.176585
+                    Temp_mean_6h           0.090944
+                 BUN_velocity_1h           0.085844
+Bilirubin_total_hours_since_last           0.065738
+                   Resp_mean_12h           0.064307
+                      HR_mean_3h           0.035888
+      Platelets_hours_since_last           0.030074
+              Creatinine_std_12h           0.029319
+                      MAP_min_3h           0.028415
+                     Temp_max_3h           0.018769
+                      BUN_max_3h           0.018755
+                    Resp_mean_3h           0.018347
+                 Lactate_std_12h           0.017743
+                      WBC_std_3h           0.014968
+                       WBC_ffill           0.014784
 
-Spearman rank correlation, TabNet importance vs. XGBoost SHAP importance, over 289 shared features: rho=0.181, p=1.98e-03
-Top-15 feature overlap between TabNet and SHAP rankings: 4/15
+(No shap_feature_importance.csv found in /kaggle/working/outputs or the attached input dataset -- run 05_explainability.py first, or add its output to the dataset, to get the SHAP-vs-TabNet ranking comparison.)

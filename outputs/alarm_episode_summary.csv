@@ -1,0 +1,6 @@
+model,threshold,n_patients,n_septic_patients,n_alert_hours,n_alarm_episodes,hour_to_episode_reduction_x,n_true_positive_episodes,n_false_positive_episodes,septic_patients_with_ge1_tp_episode,septic_patients_caught_rate,fp_episodes_per_1000_patient_days,median_tp_episode_duration_h,median_fp_episode_duration_h
+baseline,0.5408333333333333,40336,2932,299594,50248,5.96,2844,47404,2233,0.7616,746.38,6.0,2.0
+engineered,0.5,40336,2932,289124,47228,6.12,2910,44318,2368,0.8076,697.79,7.0,3.0
+tabnet,0.5816666666666667,40336,2932,279441,59752,4.68,3003,56749,2300,0.7844,893.51,5.0,2.0
+grud,0.5816666666666667,6051,429,36924,5041,7.32,317,4724,277,0.6457,501.34,8.0,2.0
+transformer,0.6633333333333333,6051,429,42408,5825,7.28,422,5403,349,0.8135,573.4,8.0,2.0

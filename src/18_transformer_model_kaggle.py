@@ -1,5 +1,17 @@
 # %% [markdown]
 # # Phase 6c — Transformer: does attention over the *whole stay* beat recurrence?
+# ### (Kaggle notebook version — full dataset, run 4 of 4 in the 04 -> 16 -> 17 -> 18 sequence)
+#
+# **Before running this notebook**, upload a private Kaggle Dataset containing
+# `sepsis.duckdb`, `utility_score.py`, and `delong.py` (same dataset as scripts
+# 04/16/17), attach it via **Notebook > Add Input > Datasets**, and turn on
+# **Settings > Accelerator > GPU T4 x2** (or similar). Paths are auto-detected
+# under `/kaggle/input`. Run this script last — it depends on script 04's
+# `engineered_oof_predictions.parquet` (for the vs-XGBoost DeLong comparison)
+# and script 16's `grud_test_predictions.parquet` (for the vs-GRU-D DeLong
+# comparison), found automatically under `/kaggle/working/outputs` if all
+# four scripts run in the same session, or under the attached dataset
+# otherwise.
 #
 # Script 16 asked whether a recurrent architecture (GRU-D) could learn the
 # missingness signal script 02 hand-engineered, one hour at a time. This
@@ -42,16 +54,18 @@
 # rather than 03/04's GroupKFold, since this is also a BPTT-adjacent,
 # early-stopping-based recurrent-data model, not a k-fold-CV tree model).
 #
-# EVALUATION PROTOCOL DISCLOSURE (same spirit as scripts 09/16):
-# Full GroupKFold(5) refit-per-fold over all patients, at MAX_SEQ_LEN=336,
-# is not laptop-tractable for a multi-head self-attention model (O(T^2)
-# attention weights per head per layer) on the machine that OOM'd on script
-# 04 and needed subsampling for script 16. This script reuses script 16's
-# exact stratified-subsample-by-`is_ever_septic` helper and the same
-# N_SUBSAMPLE_PATIENTS, so the two deep sequence models are trained and
-# evaluated on the *same* patients and the *same* split -- making the
-# GRU-D-vs-Transformer comparison itself apples-to-apples, on top of both
-# being comparable to XGBoost.
+# EVALUATION PROTOCOL — Kaggle full-dataset version:
+# The local version of this script disclosed that full GroupKFold(5) over
+# all patients, at MAX_SEQ_LEN=336, was not laptop-tractable for a
+# multi-head self-attention model (O(T^2) attention weights per head per
+# layer), and reused script 16's stratified subsample of
+# N_SUBSAMPLE_PATIENTS=20,000 patients. On Kaggle (GPU + considerably more
+# RAM), that constraint doesn't apply the same way, so this version sets
+# N_SUBSAMPLE_PATIENTS = None to use the FULL population of patients --
+# matching script 16's full-dataset run, so the two sequence models are
+# still trained/evaluated on identical patients and the GRU-D-vs-Transformer
+# comparison stays apples-to-apples, on top of both being comparable to
+# XGBoost.
 
 # %%
 import gc
@@ -64,6 +78,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import duckdb
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 warnings.filterwarnings("ignore")
 
@@ -73,31 +90,64 @@ try:
     from torch.utils.data import Dataset, DataLoader
 except ImportError:
     sys.exit(
-        "PyTorch is required for this script and isn't in requirements.txt yet "
-        "(the rest of the pipeline is XGBoost/sklearn/duckdb only).\n"
-        "  pip install torch --index-url https://download.pytorch.org/whl/cpu\n"
-        "CPU is enough here -- small model, subsampled patients."
+        "PyTorch is required for this script. On Kaggle it's preinstalled --\n"
+        "if this fires anyway, check Settings > Environment."
     )
 
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score, average_precision_score
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+# ---- Kaggle paths ---------------------------------------------------------
+# Same auto-detection convention as 17_tabnet_model_kaggle.py: search for
+# sepsis.duckdb under /kaggle/input rather than hardcoding a dataset slug,
+# since Kaggle's exact attached-dataset nesting has changed before.
+KAGGLE_ROOT = Path("/kaggle/input")
+_candidates = sorted(KAGGLE_ROOT.glob("**/sepsis.duckdb"))
+if not _candidates:
+    sys.exit(
+        f"Couldn't find sepsis.duckdb anywhere under {KAGGLE_ROOT}.\n"
+        f"Check that your Kaggle Dataset (containing sepsis.duckdb, "
+        f"utility_score.py, delong.py, etc.) is attached via "
+        f"Notebook > Add Input > Datasets."
+    )
+if len(_candidates) > 1:
+    print(f"Warning: found {len(_candidates)} sepsis.duckdb files under {KAGGLE_ROOT}, "
+          f"using the first one: {_candidates[0]}")
+DB_PATH = _candidates[0]
+KAGGLE_INPUT_DIR = DB_PATH.parent
+OUT_DIR = Path("/kaggle/working/outputs")
+FIG_DIR = OUT_DIR / "figures"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+FIG_DIR.mkdir(parents=True, exist_ok=True)
+print(f"Using dataset directory: {KAGGLE_INPUT_DIR}")
+
+sys.path.insert(0, str(KAGGLE_INPUT_DIR))
 from utility_score import normalized_utility_score, sweep_thresholds_for_utility
 from delong import delong_roc_test, delong_ci_line
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DB_PATH = PROJECT_ROOT / "warehouse" / "sepsis.duckdb"
-OUT_DIR = PROJECT_ROOT / "outputs"
-FIG_DIR = OUT_DIR / "figures"
-OUT_DIR.mkdir(exist_ok=True)
-FIG_DIR.mkdir(exist_ok=True)
+
+def find_prior_output(filename):
+    """Look for another script's output first in this session's own working
+    outputs (if it already ran earlier in this same Kaggle session -- e.g.
+    scripts 04/16 immediately before this one), then fall back to the
+    attached input dataset (if produced in an earlier, separate Kaggle run)."""
+    for candidate in (OUT_DIR / filename, KAGGLE_INPUT_DIR / filename):
+        if candidate.exists():
+            return candidate
+    return None
+
+
+print(f"[18_transformer_model_kaggle] torch device: {torch.device('cuda' if torch.cuda.is_available() else 'cpu')}"
+      + ("" if torch.cuda.is_available() else
+         "  -- no GPU detected. On Kaggle: Notebook Settings > Accelerator > "
+         "GPU T4 x2 (or similar), then re-run. This script trains via backprop "
+         "over the full patient population and benefits a lot from a GPU."))
 
 # ---- config ---------------------------------------------------------------
-N_SUBSAMPLE_PATIENTS = 20000     # bumped from 8,000, still identical to script 16's value so the
-                                  # two sequence models share patients -- targeted power increase
-                                  # for the vs-XGBoost comparison (p=0.123 at n=8,000); single
-                                  # 70/15/15 split kept as-is, no CV rewrite
+N_SUBSAMPLE_PATIENTS = None      # None = use the FULL patient population, matching script 16's
+                                  # full-dataset run (Kaggle has the RAM/GPU headroom the local
+                                  # 7.4GB-RAM machine didn't); the local version subsampled to
+                                  # 20,000 for laptop tractability
 MAX_SEQ_LEN = 336               # PhysioNet 2019 max ICULOS, same as script 16
 RANDOM_STATE = 42               # matches every other script's RANDOM_STATE/seed
 BATCH_SIZE = 64
@@ -153,17 +203,32 @@ def load_patient_subsample(con):
     patients = con.execute(
         "SELECT patient_id, is_ever_septic FROM dim_patient"
     ).df()
-    sub = stratified_subsample(patients, N_SUBSAMPLE_PATIENTS, RANDOM_STATE)
-    log(
-        f"\nEVALUATION PROTOCOL DISCLOSURE:\n"
-        f"  Full GroupKFold(5) refit-per-fold over all {len(patients):,} patients is not\n"
-        f"  tractable for an O(T^2)-attention Transformer on this machine (7.4GB RAM --\n"
-        f"  the same machine that OOM'd on script 04 and needed subsampling for script\n"
-        f"  16). Training below therefore reuses script 16's exact stratified subsample\n"
-        f"  of n={N_SUBSAMPLE_PATIENTS:,} patients (seed={RANDOM_STATE}), same 70/15/15\n"
-        f"  train/val/test split by patient, so GRU-D and this Transformer are compared\n"
-        f"  on identical patients as well as both being compared to XGBoost."
-    )
+    if N_SUBSAMPLE_PATIENTS is None:
+        # Full population, still shuffled (frac=1.0 sample) rather than
+        # taken in table order, and still seeded, for parity with the
+        # subsampled path's determinism.
+        sub = stratified_subsample(patients, len(patients), RANDOM_STATE)
+        log(
+            f"\nFULL-DATASET RUN (Kaggle): training on all {len(patients):,} patients -- "
+            f"no subsampling, matching script 16's full-dataset run so GRU-D and this\n"
+            f"  Transformer are still compared on identical patients. The local version of\n"
+            f"  this script reused script 16's stratified subsample of n=20,000 patients as\n"
+            f"  a laptop-RAM tractability workaround; that constraint doesn't apply on\n"
+            f"  Kaggle. Still split 70/15/15 train/val/test by patient (stratified on\n"
+            f"  is_ever_septic)."
+        )
+    else:
+        sub = stratified_subsample(patients, N_SUBSAMPLE_PATIENTS, RANDOM_STATE)
+        log(
+            f"\nEVALUATION PROTOCOL DISCLOSURE:\n"
+            f"  Full GroupKFold(5) refit-per-fold over all {len(patients):,} patients is not\n"
+            f"  tractable for an O(T^2)-attention Transformer on this machine (7.4GB RAM --\n"
+            f"  the same machine that OOM'd on script 04 and needed subsampling for script\n"
+            f"  16). Training below therefore reuses script 16's exact stratified subsample\n"
+            f"  of n={N_SUBSAMPLE_PATIENTS:,} patients (seed={RANDOM_STATE}), same 70/15/15\n"
+            f"  train/val/test split by patient, so GRU-D and this Transformer are compared\n"
+            f"  on identical patients as well as both being compared to XGBoost."
+        )
     log(f"  Sepsis rate -- full population: {patients['is_ever_septic'].mean():.4f}, "
         f"subsample: {sub['is_ever_septic'].mean():.4f}")
     return sub["patient_id"].tolist()
@@ -357,6 +422,196 @@ def run_epoch(model, loader, optimizer, pos_weight, train):
 
 
 # %% [markdown]
+# ## Step 4b — occlusion: does the Transformer actually need its most recent
+# ## hours, or is it coasting on stale/earlier information?
+#
+# Complements the attention-by-lag analysis below with a causal check rather
+# than a descriptive one: attention weight is only a *proxy* for reliance
+# (a position can be attended-to without the output actually depending on
+# it, and vice versa). Occlusion measures the real effect: replace the
+# input at some hours with "unknown" and see whether the prediction moves.
+#
+# TRAP THIS DELIBERATELY AVOIDS: you might be tempted to occlude the last N
+# hours by just slicing them off the end of the sequence (`seq[:-N]`). Don't
+# -- that shortens T, which shifts every remaining position's index by
+# nothing (they keep their original indices 0..T-N-1) but changes what
+# `pos_enc` and the causal mask see as "how long is this sequence" and, more
+# importantly, silently turns "occlude recent data" into a second, entangled
+# manipulation: "and also change the input shape/length," which the
+# Transformer's positional encoding and attention pattern are NOT invariant
+# to. The fix is to keep T and every position index IDENTICAL to the
+# original run, and only overwrite the *content* at the occluded positions
+# (value -> the same post-standardization train-mean already used for
+# ordinary missingness in this script, i.e. 0.0; mask -> 0, "missing"). That
+# isolates "what did removing information do" from "what did changing the
+# input shape do."
+#
+# Reference point per patient (the single query position whose prediction
+# we track): the hour immediately before sepsis onset for septic patients
+# (the same clinically critical, alarm-relevant instant script 06's lead-
+# time analysis anchors on), or the last recorded hour for non-septic
+# patients. Occluding a fixed trailing window ending at that one reference
+# position, then reading off only that position's prediction, is what keeps
+# this "cheap additional inference": one forward pass over the whole test
+# set per window size N, reusing the already-trained `model` sitting in
+# memory -- no retraining, no checkpoint reload required.
+
+# %%
+def occlude_trailing_window(seq, n, reference_idx, n_vitals):
+    """Return a COPY of `seq` with positions [reference_idx-n+1, reference_idx]
+    (inclusive, clipped at 0) overwritten to look exactly like ordinary
+    missingness: value -> 0.0 (post-standardization train-mean, matching
+    build_patient_arrays' existing impute convention for this script), mask
+    -> 0. Sequence length and every other position are untouched. Delta
+    (hours-since-last-observed) is recomputed causally from the NEW mask so
+    it stays internally consistent -- it would be self-contradictory to mark
+    hours "missing" via the mask channel while delta still claims they were
+    just observed.
+    """
+    T = len(seq["labels"])
+    lo = max(0, reference_idx - n + 1)
+    hi = reference_idx + 1  # exclusive
+    new_values = seq["values"].copy()
+    new_mask = seq["mask"].copy()
+    new_values[lo:hi, :] = 0.0
+    new_mask[lo:hi, :] = 0.0
+
+    new_delta = np.zeros((T, n_vitals), dtype=np.float32)
+    for d in range(n_vitals):
+        last_seen = 0.0
+        for t in range(1, T):
+            last_seen = 1.0 if new_mask[t - 1, d] == 1 else last_seen + 1.0
+            new_delta[t, d] = last_seen
+    new_delta_norm = new_delta / MAX_SEQ_LEN
+
+    occluded = dict(seq)
+    occluded["values"] = new_values
+    occluded["mask"] = new_mask
+    occluded["delta"] = new_delta_norm
+    return occluded
+
+
+def reference_indices(seqs):
+    """Per patient: hour before onset (septic) or last recorded hour
+    (non-septic). Returned as within-sequence array positions -- valid
+    because `hour` is 0-indexed and consecutive per patient (same fact this
+    script's delta construction already relies on), so array position ==
+    hour value whenever a stay wasn't truncated at MAX_SEQ_LEN."""
+    refs = []
+    for s in seqs:
+        labels = s["labels"]
+        T = len(labels)
+        if labels.max() == 1:
+            onset_idx = int(np.argmax(labels))
+            refs.append(max(onset_idx - 1, 0))
+        else:
+            refs.append(T - 1)
+    return refs
+
+
+def predict_at_reference(model, seqs, ref_idx_list, batch_size=BATCH_SIZE):
+    """One forward pass over `seqs` (already-built, possibly-occluded
+    sequences), returning each patient's predicted probability at their own
+    `ref_idx_list[i]` position only."""
+    model.eval()
+    loader = DataLoader(
+        list(zip(seqs, ref_idx_list)),
+        batch_size=batch_size, shuffle=False,
+        collate_fn=lambda batch: _collate_with_ref([b[0] for b in batch], [b[1] for b in batch]),
+    )
+    out = []
+    with torch.no_grad():
+        for v, m, dl, pad_mask, refs in loader:
+            v, m, dl, pad_mask = v.to(DEVICE), m.to(DEVICE), dl.to(DEVICE), pad_mask.to(DEVICE)
+            logits = model(v, m, dl, pad_mask)
+            probs = torch.sigmoid(logits).cpu().numpy()
+            for i, r in enumerate(refs):
+                out.append(float(probs[i, r]))
+    return np.array(out)
+
+
+def _collate_with_ref(seqs, refs):
+    lengths = [len(s["labels"]) for s in seqs]
+    T_max, B, D = max(lengths), len(seqs), seqs[0]["values"].shape[1]
+    v = torch.zeros(B, T_max, D)
+    m = torch.zeros(B, T_max, D)
+    dl = torch.zeros(B, T_max, D)
+    pad_mask = torch.ones(B, T_max, dtype=torch.bool)
+    for i, s in enumerate(seqs):
+        T = lengths[i]
+        v[i, :T] = torch.from_numpy(s["values"])
+        m[i, :T] = torch.from_numpy(s["mask"])
+        dl[i, :T] = torch.from_numpy(s["delta"])
+        pad_mask[i, :T] = False
+    return v, m, dl, pad_mask, refs
+
+
+def run_occlusion_analysis(model, test_seqs, locked_threshold,
+                            windows=(1, 2, 3, 6, 12, 24, 48)):
+    log("\n--- Occlusion analysis: masking the trailing N hours before each "
+        "patient's reference point (onset-1 if septic, else last hour) ---")
+    n_vitals = test_seqs[0]["values"].shape[1]
+    refs = reference_indices(test_seqs)
+    is_septic = np.array([s["labels"].max() == 1 for s in test_seqs])
+    y_septic = is_septic.astype(int)
+
+    baseline_probs = predict_at_reference(model, test_seqs, refs)
+    baseline_positive_rate = float((baseline_probs[is_septic] >= locked_threshold).mean())
+
+    rows = []
+    for n in windows:
+        occluded_seqs = [
+            occlude_trailing_window(s, n, r, n_vitals) for s, r in zip(test_seqs, refs)
+        ]
+        occ_probs = predict_at_reference(model, occluded_seqs, refs)
+
+        mean_abs_delta = float(np.mean(np.abs(occ_probs - baseline_probs)))
+        mean_abs_delta_septic = float(np.mean(np.abs(occ_probs[is_septic] - baseline_probs[is_septic])))
+        auroc_baseline = roc_auc_score(y_septic, baseline_probs)
+        auroc_occluded = roc_auc_score(y_septic, occ_probs)
+        occluded_positive_rate = float((occ_probs[is_septic] >= locked_threshold).mean())
+
+        rows.append({
+            "occlusion_window_hours": n,
+            "n_patients": len(test_seqs), "n_septic_patients": int(is_septic.sum()),
+            "mean_abs_prob_delta_all": mean_abs_delta,
+            "mean_abs_prob_delta_septic": mean_abs_delta_septic,
+            "auroc_at_reference_baseline": auroc_baseline,
+            "auroc_at_reference_occluded": auroc_occluded,
+            "septic_alarm_rate_at_reference_baseline": baseline_positive_rate,
+            "septic_alarm_rate_at_reference_occluded": occluded_positive_rate,
+        })
+        log(f"  N={n:>3}h: mean|Δp| (septic)={mean_abs_delta_septic:.4f}  "
+            f"AUROC {auroc_baseline:.4f} -> {auroc_occluded:.4f}  "
+            f"septic alarm-rate-at-reference {baseline_positive_rate:.3f} -> {occluded_positive_rate:.3f}")
+
+    occ_df = pd.DataFrame(rows)
+    occ_df.to_csv(OUT_DIR / "transformer_occlusion_by_window.csv", index=False)
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    axes[0].plot(occ_df["occlusion_window_hours"], occ_df["mean_abs_prob_delta_septic"], marker="o")
+    axes[0].set_xlabel("Occluded trailing window (hours)")
+    axes[0].set_ylabel("Mean |Δ predicted probability| (septic patients)")
+    axes[0].set_title("Prediction sensitivity to recent-data occlusion")
+
+    axes[1].plot(occ_df["occlusion_window_hours"], occ_df["septic_alarm_rate_at_reference_baseline"],
+                 marker="o", label="baseline (unoccluded)")
+    axes[1].plot(occ_df["occlusion_window_hours"], occ_df["septic_alarm_rate_at_reference_occluded"],
+                 marker="o", label="occluded")
+    axes[1].axhline(1.0, color="grey", lw=0.5, ls=":")
+    axes[1].set_xlabel("Occluded trailing window (hours)")
+    axes[1].set_ylabel("Fraction of septic patients still alarming\nat reference point (locked threshold)")
+    axes[1].set_title("Would the alarm still fire without recent data?")
+    axes[1].legend(fontsize=8)
+    fig.suptitle("Transformer occlusion: reference point = hour before onset (septic) / last hour (non-septic)")
+    fig.tight_layout()
+    fig.savefig(FIG_DIR / "transformer_occlusion_by_window.png", dpi=150)
+    plt.close(fig)
+    log("Saved: transformer_occlusion_by_window.csv, figures/transformer_occlusion_by_window.png")
+    return occ_df
+
+
+# %% [markdown]
 # ## Step 5 — train, evaluate, compare to XGBoost and to GRU-D via DeLong's test
 
 # %%
@@ -421,6 +676,21 @@ def run_transformer():
                 break
 
     model.load_state_dict(best_state)
+
+    # --- val-set predictions, from the SAME best_state used for test -----
+    # Saved to disk (unlike before) so the Platt-scaling calibrator (script
+    # 19) and the alarm threshold below are both fit on val, never on test.
+    _, val_auroc_final, val_auprc_final, val_probs, val_labels = run_epoch(
+        model, val_loader, optimizer, pos_weight, train=False
+    )
+    val_pids = np.concatenate([[s["patient_id"]] * len(s["labels"]) for s in val_seqs])
+    val_hours = np.concatenate([s["hour"] for s in val_seqs])
+    val_eval_df = pd.DataFrame({
+        "patient_id": val_pids, "hour": val_hours,
+        "SepsisLabel": val_labels.astype(int), "transformer_proba": val_probs,
+    })
+    log(f"[VAL, best checkpoint] Transformer  AUROC={val_auroc_final:.4f}  AUPRC={val_auprc_final:.4f}")
+
     _, test_auroc, test_auprc, test_probs, test_labels = run_epoch(model, test_loader, optimizer, pos_weight, train=False)
     log(f"\n[TEST] Transformer  AUROC={test_auroc:.4f}  AUPRC={test_auprc:.4f}")
 
@@ -431,12 +701,22 @@ def run_transformer():
         "SepsisLabel": test_labels.astype(int), "transformer_proba": test_probs,
     })
 
+    # --- threshold LOCKED on val, then applied once to test -- previously
+    #     this swept on eval_df/test directly, which is a leak (see script
+    #     19's methodology note). ---
     thr_table = sweep_thresholds_for_utility(
-        eval_df, patient_col="patient_id", label_col="SepsisLabel", proba_col="transformer_proba"
+        val_eval_df, patient_col="patient_id", label_col="SepsisLabel", proba_col="transformer_proba"
     )
     best_row = thr_table.iloc[0]
-    log(f"[TEST] Transformer best-threshold normalized utility = {best_row.normalized_utility:.4f} "
-        f"at threshold={best_row.threshold:.2f}")
+    locked_threshold = float(best_row.threshold)
+    test_utility_at_locked_threshold = normalized_utility_score(
+        eval_df, patient_col="patient_id", label_col="SepsisLabel",
+        proba_col="transformer_proba", threshold=locked_threshold,
+    )
+    log(f"[VAL] Transformer best-threshold normalized utility = {best_row.normalized_utility:.4f} "
+        f"at threshold={locked_threshold:.2f} (selected on val, NOT test)")
+    log(f"[TEST] Transformer normalized utility at the VAL-locked threshold={locked_threshold:.2f}: "
+        f"{test_utility_at_locked_threshold:.4f}")
 
     # --- attention-weight summary: which past hours does the model lean on most? ---
     log("\nMean self-attention weight by relative lag (last encoder layer, averaged "
@@ -496,17 +776,25 @@ def run_transformer():
     log(f"Highest-attended lag: {int(top_lag)}h back "
         f"({'recency-biased' if top_lag <= 2 else 'attends further back than immediate recency'})")
 
+    # --- occlusion: causal check that complements the descriptive attention-
+    #     by-lag table above (same trained model, same test_seqs, no
+    #     retraining -- just extra forward passes) ---
+    occ_df = run_occlusion_analysis(model, test_seqs, locked_threshold)
+
     # --- DeLong's test vs XGBoost engineered model (script 04's OOF predictions) ---
     results_row = {
         "model": "transformer", "auroc": test_auroc, "auprc": test_auprc,
-        "best_threshold": best_row.threshold, "normalized_utility": best_row.normalized_utility,
+        "best_threshold": locked_threshold,
+        "normalized_utility": test_utility_at_locked_threshold,
+        "val_normalized_utility_at_threshold": best_row.normalized_utility,
+        "threshold_selection": "locked on val, applied once to test",
         "n_features": len(RAW_VITALS), "n_params": n_params,
-        "n_subsample_patients": N_SUBSAMPLE_PATIENTS,
+        "n_subsample_patients": N_SUBSAMPLE_PATIENTS if N_SUBSAMPLE_PATIENTS is not None else len(patient_ids),
         "n_train_patients": len(train_ids), "n_val_patients": len(val_ids),
         "n_test_patients": len(test_ids), "epochs_run": epoch,
     }
-    engineered_path = OUT_DIR / "engineered_oof_predictions.parquet"
-    if engineered_path.exists():
+    engineered_path = find_prior_output("engineered_oof_predictions.parquet")
+    if engineered_path is not None:
         xgb_df = pd.read_parquet(engineered_path)
         merged = eval_df.merge(
             xgb_df[["patient_id", "hour", "engineered_proba"]], on=["patient_id", "hour"], how="inner"
@@ -526,12 +814,13 @@ def run_transformer():
         results_row["vs_xgb_ci_lower"] = ci_lo
         results_row["vs_xgb_ci_upper"] = ci_hi
     else:
-        log(f"\n(No {engineered_path.name} found -- run 04_engineered_model.py first "
+        log(f"\n(No engineered_oof_predictions.parquet found in /kaggle/working/outputs "
+            f"or the attached input dataset -- run 04_engineered_model_kaggle.py first "
             f"to get the DeLong comparison against XGBoost.)")
 
     # --- DeLong's test vs GRU-D (script 16's test predictions) -- same patients, same split ---
-    grud_path = OUT_DIR / "grud_test_predictions.parquet"
-    if grud_path.exists():
+    grud_path = find_prior_output("grud_test_predictions.parquet")
+    if grud_path is not None:
         grud_df = pd.read_parquet(grud_path)
         merged_g = eval_df.merge(
             grud_df[["patient_id", "hour", "grud_proba"]], on=["patient_id", "hour"], how="inner"
@@ -553,15 +842,19 @@ def run_transformer():
             results_row["vs_grud_ci_lower"] = ci_lo_g
             results_row["vs_grud_ci_upper"] = ci_hi_g
     else:
-        log(f"\n(No {grud_path.name} found -- run 16_grud_model.py first "
+        log(f"\n(No grud_test_predictions.parquet found in /kaggle/working/outputs "
+            f"or the attached input dataset -- run 16_grud_model_kaggle.py first "
             f"to get the DeLong comparison against GRU-D.)")
 
     pd.DataFrame([results_row]).to_csv(OUT_DIR / "transformer_results.csv", index=False)
     eval_df.to_parquet(OUT_DIR / "transformer_test_predictions.parquet")
+    val_eval_df.to_parquet(OUT_DIR / "transformer_val_predictions.parquet")
     with open(OUT_DIR / "run18_log.txt", "w") as f:
         f.write("\n".join(log_lines))
     log(f"\nSaved: transformer_results.csv, transformer_test_predictions.parquet, "
-        f"transformer_attention_by_lag.csv, run18_log.txt ({time.time() - t0:.1f}s total)")
+        f"transformer_val_predictions.parquet, transformer_attention_by_lag.csv, "
+        f"transformer_occlusion_by_window.csv, figures/transformer_occlusion_by_window.png, "
+        f"run18_log.txt ({time.time() - t0:.1f}s total)")
     return results_row
 
 

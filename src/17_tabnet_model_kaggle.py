@@ -1,6 +1,6 @@
 # %% [markdown]
 # # Phase 6b — TabNet: does attention beat trees on the *same* feature table?
-# ### (Kaggle notebook version)
+# ### (Kaggle notebook version — full dataset, run 3 of 4 in the 04 -> 16 -> 17 -> 18 sequence)
 #
 # **Before running this notebook**, upload a private Kaggle Dataset containing:
 #   - `sepsis.duckdb` (the warehouse built by `01_etl_warehouse.py` + `02_feature_engineering.py`)
@@ -21,13 +21,13 @@
 #
 # Everything below is otherwise the same script as the local version: same
 # leakage-safe patient-grouped CV, same utility metric, same DeLong's-test
-# helper. The only things that differ are (1) `ROW_SUBSAMPLE_FRAC = 0.35` —
-# still subsampled, not the full 1.55M-row table, after a full run took ~2hrs
-# instead of the expected ~20min (root cause: an unlogged `np.nanmedian` call
-# on the full table, fixed below, but the subsample is kept as a safety net
-# until a run confirms the per-fold [timing] breakdown is fast end to end) —
-# and (2) input/output paths auto-detected under `/kaggle/input/` and
-# pointed at `/kaggle/working/` instead of the local repo layout.
+# helper. The only things that differ are (1) `ROW_SUBSAMPLE_FRAC = None` —
+# a 35%-patient-subsample run confirmed the real bottlenecks (nanmedian,
+# object-dtype patient_id grouping) are fixed, so this now runs the full
+# 1.55M-row table for the strongest defensible number, expected to finish
+# in ~45min-1hr rather than the original ~2hr — and (2) input/output paths
+# auto-detected under `/kaggle/input/` and pointed at `/kaggle/working/`
+# instead of the local repo layout.
 #
 # Script 04 trained XGBoost on `fact_features` (289 columns: forward-filled
 # raw values, rolling stats, slopes/velocity, missingness flags, clinical
@@ -129,7 +129,7 @@ if len(_candidates) > 1:
           f"using the first one: {_candidates[0]}")
 DB_PATH = _candidates[0]
 KAGGLE_INPUT_DIR = DB_PATH.parent
-PRIOR_OUTPUTS_DIR = KAGGLE_INPUT_DIR   # where engineered_oof_predictions.parquet / shap_feature_importance.csv live (read-only)
+PRIOR_OUTPUTS_DIR = KAGGLE_INPUT_DIR   # where engineered_oof_predictions.parquet / shap_feature_importance.csv live (read-only), if this notebook is a standalone continuation of an earlier session
 OUT_DIR = Path("/kaggle/working/outputs")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 print(f"Using dataset directory: {KAGGLE_INPUT_DIR}")
@@ -137,6 +137,17 @@ print(f"Using dataset directory: {KAGGLE_INPUT_DIR}")
 sys.path.insert(0, str(KAGGLE_INPUT_DIR))
 from utility_score import normalized_utility_score, sweep_thresholds_for_utility
 from delong import delong_roc_test
+
+
+def find_prior_output(filename):
+    """Look for another script's output first in this session's own working
+    outputs (if it already ran earlier in this same Kaggle session -- e.g.
+    script 04 immediately before this one), then fall back to the attached
+    input dataset (if it was produced in an earlier, separate Kaggle run)."""
+    for candidate in (OUT_DIR / filename, PRIOR_OUTPUTS_DIR / filename):
+        if candidate.exists():
+            return candidate
+    return None
 
 # ---- config -------------------------------------------------------------
 N_FOLDS = 5                 # must match 03/04 so the DeLong comparison is fold-aligned
@@ -151,20 +162,21 @@ print(f"[17_tabnet_model_kaggle] torch device: {DEVICE}"
          "benefits from a GPU far more than XGBoost does."))
 
 # ROW_SUBSAMPLE_FRAC: fraction of fact_features rows to keep. The local
-# version of this script sets this to 0.15 as a memory patch for an 8GB-RAM
-# laptop that OOM'd at N=1.55M rows x 289 float32 cols. The original
+# version of this script sets this to 0.15 as a memory patch for an 8GB-RAM# laptop that OOM'd at N=1.55M rows x 289 float32 cols. The original
 # assumption here was that Kaggle's larger RAM budget removed that
 # constraint entirely -- in practice, a full run (ROW_SUBSAMPLE_FRAC=None)
 # took ~2 hours to get through 4 folds despite per-epoch fit() timings
-# staying fast and unchanged (~26s/epoch), which points at a huge,
-# previously-unlogged time sink in the per-fold preprocessing on the full
-# table (see the [timing] log line added to fit_fold -- np.nanmedian on a
-# ~1M-row x 289-col array was the leading suspect and has been swapped for
-# `bottleneck`'s much faster implementation, but capping table size here
-# too is a cheap, concrete safety net rather than assuming that one fix is
-# sufficient). Bump back toward None only once a subsampled run confirms
-# the per-fold [timing] breakdown is actually fast end to end.
-ROW_SUBSAMPLE_FRAC = 0.35
+# staying fast and unchanged (~26s/epoch), which pointed at a huge,
+# previously-unlogged time sink in per-fold preprocessing. Root-caused and
+# fixed: (1) np.nanmedian on the full table -> bottleneck.nanmedian, and
+# (2) patient_id as an object-dtype string array -> factorized to int32
+# before any GroupKFold/np.unique/np.isin call. A 35%-subsample run after
+# both fixes finished all 5 folds in ~17 minutes with split=0.0s and
+# nanmedian~1s per fold, confirming those were the actual bottlenecks, not
+# Kaggle's compute/RAM budget. Back to the full table now for the strongest
+# defensible number in the final report -- expect roughly 3x the subsampled
+# run's wall time (~45min-1hr), not the original ~2hr+.
+ROW_SUBSAMPLE_FRAC = None
 
 # Lighter than pytorch-tabnet's own defaults (n_d=n_a=8 is the library
 # default; 16 trades a little capacity for a smaller compute graph -- this
@@ -190,6 +202,20 @@ TABNET_PARAMS = dict(
 # epochs to actually show whether decayed LR stabilizes val_auc before
 # early stopping decides the run is done.
 FIT_PARAMS = dict(max_epochs=40, patience=8, batch_size=2048, virtual_batch_size=256)
+
+# compute_importance=False: pytorch-tabnet's fit() otherwise runs an extra,
+# undocumented-in-cost full forward pass over the *entire* training set at
+# the end of every fold (abstract_model.py: `if self.compute_importance:
+# self.feature_importances_ = self._compute_feature_importances(X_train)`,
+# which calls `explain()` -> `network.forward_masks()` batch-by-batch with
+# CPU-side sparse-matrix bookkeeping per batch). run17's [timing] line
+# showed this costing ~520-580s per fold on the full 1.24M-row training
+# set -- more than the entire epoch loop that preceded it. We still want
+# feature importances (top-15 table, Spearman-vs-SHAP comparison below),
+# just not computed on every training row: IMPORTANCE_SUBSAMPLE_FRAC controls
+# how much of X_tr gets passed to the public `explain()` API ourselves,
+# after fit(), instead of letting the library do it on the full set.
+IMPORTANCE_SUBSAMPLE_FRAC = 0.10
 
 NON_FEATURE_COLS = {"patient_id", "hospital_id", "hour", "ICULOS", "SepsisLabel"}
 
@@ -299,13 +325,48 @@ def fit_fold(X_train, y_train, groups_train, X_test):
     model.fit(
         X_tr, y_tr, eval_set=[(X_val, y_val)], eval_metric=["auc"],
         weights=1,  # TabNet's built-in equivalent of XGBoost's scale_pos_weight
+        compute_importance=False,  # see IMPORTANCE_SUBSAMPLE_FRAC comment above
         **FIT_PARAMS,
     )
+    t_fit_done = time.time()
+
+    # [timing] predict/importance/cleanup: run17's Kaggle log showed a silent
+    # 500-600s gap per fold between the "Early stopping occurred" print and
+    # the next `log()` line (the fold's AUROC), with nothing in between to
+    # explain it. Root-caused: with compute_importance defaulting to True,
+    # fit() itself was running a full attention-mask forward pass over all
+    # ~1.24M training rows internally before returning -- not predict_proba,
+    # not the property access, not cleanup, all of which were already fast
+    # (confirmed by the [timing] line's own predict=4.3s/feature_importances=
+    # 0.0s/cleanup=0.2s while fit=870.4s absorbed the whole gap). Now that
+    # compute_importance=False skips that internal pass, `fit` here should
+    # roughly match the epoch loop's own printed elapsed time, and the
+    # replacement subsampled explain() call below is timed on its own line.
     proba_test = model.predict_proba(X_te)[:, 1]
+    t_predict_done = time.time()
+
+    # Manual, subsampled replacement for the fit()-internal importance
+    # computation: same public explain() API pytorch-tabnet's own
+    # _compute_feature_importances uses, just over IMPORTANCE_SUBSAMPLE_FRAC
+    # of X_tr instead of all of it. Sampling noise here is a non-issue since
+    # run_tabnet() already averages fold_importances across all 5 folds.
+    rng = np.random.default_rng(RANDOM_STATE)
+    n_sub = max(1, int(len(X_tr) * IMPORTANCE_SUBSAMPLE_FRAC))
+    sub_idx = rng.choice(len(X_tr), size=n_sub, replace=False)
+    M_explain, _ = model.explain(X_tr[sub_idx], normalize=False)
+    sum_explain = M_explain.sum(axis=0)
+    importances = sum_explain / np.sum(sum_explain)
+    t_importance_done = time.time()
 
     del X_tr, X_val, X_te, y_tr, y_val, scaler
     gc.collect()
-    return proba_test, model
+    t_cleanup_done = time.time()
+
+    log(f"  [timing] fit={t_fit_done - t_impute_done:.1f}s  "
+        f"predict={t_predict_done - t_fit_done:.1f}s  "
+        f"feature_importances(n={n_sub:,})={t_importance_done - t_predict_done:.1f}s  "
+        f"cleanup={t_cleanup_done - t_importance_done:.1f}s")
+    return proba_test, importances
 
 
 # %% [markdown]
@@ -339,20 +400,22 @@ def run_tabnet():
         test_patients = set(groups[test_idx])
         assert train_patients.isdisjoint(test_patients), "PATIENT LEAKAGE DETECTED"
 
-        proba_test, model = fit_fold(X[train_idx], y[train_idx], groups[train_idx], X[test_idx])
+        proba_test, importances = fit_fold(X[train_idx], y[train_idx], groups[train_idx], X[test_idx])
         oof_proba[test_idx] = proba_test
-        fold_importances.append(model.feature_importances_)
+        fold_importances.append(importances)
 
         auc = roc_auc_score(y[test_idx], proba_test)
         ap = average_precision_score(y[test_idx], proba_test)
         log(f"  fold {fold}: AUROC={auc:.4f}  AUPRC={ap:.4f}  "
             f"(train={len(train_patients):,} pts / test={len(test_patients):,} pts)")
 
-        # Was previously implicit (relying on Python's refcounting once `model`
-        # is reassigned next iteration). Made explicit because this loop does
-        # 5 full refits in one process and script 17 -- unlike 16 -- had no
-        # del/gc.collect() discipline at all between them.
-        del proba_test, model, train_patients, test_patients
+        # `model` no longer escapes fit_fold at all (fit_fold now returns the
+        # already-extracted feature_importances_ array instead of the model
+        # object itself), so there's one less large object -- optimizer
+        # state, network weights, TabNet's internal explain-matrix buffers --
+        # to keep alive between folds. `importances` is a small (n_features,)
+        # array already appended to fold_importances above, safe to drop too.
+        del proba_test, importances, train_patients, test_patients
         gc.collect()
 
     df["tabnet_proba"] = oof_proba
@@ -374,8 +437,8 @@ def run_tabnet():
         "best_threshold": best_row.threshold, "normalized_utility": best_row.normalized_utility,
         "n_features": len(feature_cols),
     }
-    engineered_path = PRIOR_OUTPUTS_DIR / "engineered_oof_predictions.parquet"
-    if engineered_path.exists():
+    engineered_path = find_prior_output("engineered_oof_predictions.parquet")
+    if engineered_path is not None:
         xgb_df = pd.read_parquet(engineered_path)
         merged = df[["patient_id", "hour", "SepsisLabel", "tabnet_proba"]].merge(
             xgb_df[["patient_id", "hour", "engineered_proba"]], on=["patient_id", "hour"], how="inner"
@@ -391,7 +454,8 @@ def run_tabnet():
             f"z={test_result['z']:.2f}, p={test_result['p_value']:.2e}")
         results_row.update(test_result)
     else:
-        log(f"\n(No {engineered_path.name} found -- run 04_engineered_model.py first "
+        log(f"\n(No engineered_oof_predictions.parquet found in /kaggle/working/outputs "
+            f"or the attached input dataset -- run 04_engineered_model_kaggle.py first "
             f"to get the DeLong comparison against XGBoost.)")
 
     # --- feature-ranking comparison: TabNet's attention-mask importances vs script 05's SHAP ---
@@ -405,8 +469,8 @@ def run_tabnet():
         "(averaged across 5 folds):")
     log(tabnet_rank.head(15).to_string(index=False))
 
-    shap_path = PRIOR_OUTPUTS_DIR / "shap_feature_importance.csv"
-    if shap_path.exists():
+    shap_path = find_prior_output("shap_feature_importance.csv")
+    if shap_path is not None:
         shap_rank = pd.read_csv(shap_path).sort_values("mean_abs_shap", ascending=False).reset_index(drop=True)
         common = sorted(set(tabnet_rank["feature"]) & set(shap_rank["feature"]))
         tn_pos = tabnet_rank.set_index("feature").loc[common]
@@ -424,8 +488,9 @@ def run_tabnet():
         results_row["shap_rank_spearman_p"] = p
         results_row["top15_overlap_with_shap"] = top15_overlap
     else:
-        log(f"\n(No {shap_path.name} found -- run 05_explainability.py first "
-            f"to get the SHAP-vs-TabNet ranking comparison.)")
+        log(f"\n(No shap_feature_importance.csv found in /kaggle/working/outputs "
+            f"or the attached input dataset -- run 05_explainability.py first, or add "
+            f"its output to the dataset, to get the SHAP-vs-TabNet ranking comparison.)")
 
     pd.DataFrame([results_row]).to_csv(OUT_DIR / "tabnet_results.csv", index=False)
     df[["patient_id", "hour", "SepsisLabel", "tabnet_proba"]].to_parquet(
