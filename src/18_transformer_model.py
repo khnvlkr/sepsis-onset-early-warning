@@ -42,7 +42,7 @@
 # rather than 03/04's GroupKFold, since this is also a BPTT-adjacent,
 # early-stopping-based recurrent-data model, not a k-fold-CV tree model).
 #
-# COMPUTE-CONSTRAINT DISCLOSURE (same spirit as scripts 09/16):
+# EVALUATION PROTOCOL DISCLOSURE (same spirit as scripts 09/16):
 # Full GroupKFold(5) refit-per-fold over all patients, at MAX_SEQ_LEN=336,
 # is not laptop-tractable for a multi-head self-attention model (O(T^2)
 # attention weights per head per layer) on the machine that OOM'd on script
@@ -84,7 +84,7 @@ from sklearn.metrics import roc_auc_score, average_precision_score
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from utility_score import normalized_utility_score, sweep_thresholds_for_utility
-from delong import delong_roc_test
+from delong import delong_roc_test, delong_ci_line
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DB_PATH = PROJECT_ROOT / "warehouse" / "sepsis.duckdb"
@@ -94,7 +94,10 @@ OUT_DIR.mkdir(exist_ok=True)
 FIG_DIR.mkdir(exist_ok=True)
 
 # ---- config ---------------------------------------------------------------
-N_SUBSAMPLE_PATIENTS = 8000     # identical to script 16, so the two sequence models share patients
+N_SUBSAMPLE_PATIENTS = 20000     # bumped from 8,000, still identical to script 16's value so the
+                                  # two sequence models share patients -- targeted power increase
+                                  # for the vs-XGBoost comparison (p=0.123 at n=8,000); single
+                                  # 70/15/15 split kept as-is, no CV rewrite
 MAX_SEQ_LEN = 336               # PhysioNet 2019 max ICULOS, same as script 16
 RANDOM_STATE = 42               # matches every other script's RANDOM_STATE/seed
 BATCH_SIZE = 64
@@ -152,7 +155,7 @@ def load_patient_subsample(con):
     ).df()
     sub = stratified_subsample(patients, N_SUBSAMPLE_PATIENTS, RANDOM_STATE)
     log(
-        f"\nCOMPUTE-CONSTRAINT DISCLOSURE:\n"
+        f"\nEVALUATION PROTOCOL DISCLOSURE:\n"
         f"  Full GroupKFold(5) refit-per-fold over all {len(patients):,} patients is not\n"
         f"  tractable for an O(T^2)-attention Transformer on this machine (7.4GB RAM --\n"
         f"  the same machine that OOM'd on script 04 and needed subsampling for script\n"
@@ -517,7 +520,11 @@ def run_transformer():
             f"predictions, {merged['patient_id'].nunique():,} patients): "
             f"AUC {test_result['auc_a']:.4f} -> {test_result['auc_b']:.4f}, "
             f"z={test_result['z']:.2f}, p={test_result['p_value']:.2e}")
+        ci_lo, ci_hi, ci_line = delong_ci_line(test_result, "vs XGBoost")
+        log(ci_line)
         results_row.update({f"vs_xgb_{k}": v for k, v in test_result.items()})
+        results_row["vs_xgb_ci_lower"] = ci_lo
+        results_row["vs_xgb_ci_upper"] = ci_hi
     else:
         log(f"\n(No {engineered_path.name} found -- run 04_engineered_model.py first "
             f"to get the DeLong comparison against XGBoost.)")
@@ -540,7 +547,11 @@ def run_transformer():
                 f"subsample/split, so this comparison is exact, not approximate): "
                 f"AUC {test_result_g['auc_a']:.4f} -> {test_result_g['auc_b']:.4f}, "
                 f"z={test_result_g['z']:.2f}, p={test_result_g['p_value']:.2e}")
+            ci_lo_g, ci_hi_g, ci_line_g = delong_ci_line(test_result_g, "vs GRU-D")
+            log(ci_line_g)
             results_row.update({f"vs_grud_{k}": v for k, v in test_result_g.items()})
+            results_row["vs_grud_ci_lower"] = ci_lo_g
+            results_row["vs_grud_ci_upper"] = ci_hi_g
     else:
         log(f"\n(No {grud_path.name} found -- run 16_grud_model.py first "
             f"to get the DeLong comparison against GRU-D.)")

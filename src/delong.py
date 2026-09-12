@@ -71,16 +71,41 @@ def delong_roc_test(y_true: np.ndarray, proba_a: np.ndarray, proba_b: np.ndarray
     auc_diff = aucs[0] - aucs[1]
     var = cov[0, 0] + cov[1, 1] - 2 * cov[0, 1]
     var = max(var, 1e-12)  # numerical floor
-    z = auc_diff / np.sqrt(var)
+    se = np.sqrt(var)
+    z = auc_diff / se
     p_value = 2 * (1 - stats.norm.cdf(abs(z)))
 
     return {
         "auc_a": float(aucs[0]),
         "auc_b": float(aucs[1]),
         "auc_diff": float(auc_diff),
+        "se": float(se),
         "z": float(z),
         "p_value": float(p_value),
     }
+
+
+def delong_ci_line(test_result: dict, label: str, alpha: float = 0.05) -> tuple:
+    """
+    Given a delong_roc_test() result dict, compute the two-sided (1-alpha)
+    CI on auc_diff (= auc_b - auc_a) and a one-line, significance-agnostic
+    summary: reports the effect size and CI either way, and only adds a
+    significance verdict as a label, not a gate on whether the number gets
+    reported.
+
+    Returns (ci_lower, ci_upper, line_str).
+    """
+    z_crit = stats.norm.ppf(1 - alpha / 2)
+    diff = test_result["auc_diff"]
+    se = test_result["se"]
+    lo, hi = diff - z_crit * se, diff + z_crit * se
+    p = test_result["p_value"]
+    verdict = "significant" if p < alpha else "not significant -- reported as effect size, not chased further"
+    line = (
+        f"{label}: \u0394AUC = {diff:+.4f} (95% CI: {lo:+.4f} to {hi:+.4f}), "
+        f"p={p:.3g} ({verdict})"
+    )
+    return lo, hi, line
 
 
 if __name__ == "__main__":

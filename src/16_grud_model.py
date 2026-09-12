@@ -31,7 +31,7 @@
 # deliberately, since the whole point is that the network should learn decay
 # itself rather than being handed script 02's `_hours_since_last` columns.
 #
-# COMPUTE-CONSTRAINT DISCLOSURE (same spirit as 09_hierarchical_clustering.py):
+# EVALUATION PROTOCOL DISCLOSURE (same spirit as 09_hierarchical_clustering.py):
 # A full `GroupKFold(5)` over all ~40,336 patients, refit per fold, is not
 # laptop-tractable for a recurrent model trained with backprop-through-time
 # (this is the same 7.4GB RAM machine that OOM'd on script 04's ablation
@@ -74,7 +74,7 @@ from sklearn.metrics import roc_auc_score, average_precision_score
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from utility_score import normalized_utility_score, sweep_thresholds_for_utility
-from delong import delong_roc_test
+from delong import delong_roc_test, delong_ci_line
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DB_PATH = PROJECT_ROOT / "warehouse" / "sepsis.duckdb"
@@ -84,7 +84,9 @@ OUT_DIR.mkdir(exist_ok=True)
 FIG_DIR.mkdir(exist_ok=True)
 
 # ---- config -----------------------------------------------------------------
-N_SUBSAMPLE_PATIENTS = 8000     # same order of magnitude / same rationale as script 09
+N_SUBSAMPLE_PATIENTS = 20000     # bumped from 8,000 -- targeted power increase for the vs-XGBoost/
+                                  # vs-Transformer DeLong comparisons; still not full-population,
+                                  # still single 70/15/15 split (see script 18's matching change)
 MAX_SEQ_LEN = 336               # PhysioNet 2019 max ICULOS
 RANDOM_STATE = 42               # matches every other script's RANDOM_STATE/seed
 BATCH_SIZE = 64
@@ -139,7 +141,7 @@ def load_patient_subsample(con):
     ).df()
     sub = stratified_subsample(patients, N_SUBSAMPLE_PATIENTS, RANDOM_STATE)
     log(
-        f"\nCOMPUTE-CONSTRAINT DISCLOSURE:\n"
+        f"\nEVALUATION PROTOCOL DISCLOSURE:\n"
         f"  Full GroupKFold(5) refit-per-fold over all {len(patients):,} patients is not\n"
         f"  tractable for a BPTT-trained recurrent model on this machine (7.4GB RAM --\n"
         f"  the same machine that OOM'd on script 04). Training below therefore runs on\n"
@@ -426,7 +428,11 @@ def run_grud():
             f"{merged['patient_id'].nunique():,} patients): "
             f"AUC {test_result['auc_a']:.4f} -> {test_result['auc_b']:.4f}, "
             f"z={test_result['z']:.2f}, p={test_result['p_value']:.2e}")
+        ci_lo, ci_hi, ci_line = delong_ci_line(test_result, "vs XGBoost")
+        log(ci_line)
         results_row.update(test_result)
+        results_row["ci_lower"] = ci_lo
+        results_row["ci_upper"] = ci_hi
     else:
         log(f"\n(No {engineered_path.name} found -- run 04_engineered_model.py first "
             f"to get the DeLong comparison against XGBoost.)")
