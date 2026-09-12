@@ -1,6 +1,6 @@
 # Early Warning System for Sepsis Onset Using Dynamic Physiological Telemetry
 
-An end-to-end data warehousing + machine learning pipeline that predicts **sepsis onset 6 hours ahead** from hourly ICU vitals and labs, built on the real **PhysioNet/Computing in Cardiology Challenge 2019** dataset. The project takes ~1.55 million patient-hours of raw ICU telemetry, turns them into a queryable data warehouse, engineers a 289-feature predictive representation of each patient-hour, trains and rigorously validates a gradient-boosted model against that target, and then stress-tests the result from every angle a clinical deployment would actually need answered: does it generalize across hospitals, is it fair across patient subgroups, does it know when it's uncertain, and what does it actually buy a nurse at the bedside compared to the rule-of-thumb screening already in use.
+An end-to-end data warehousing + machine learning pipeline that predicts **sepsis onset 6 hours ahead** from hourly ICU vitals and labs, built on the real **PhysioNet/Computing in Cardiology Challenge 2019** dataset. The project takes ~1.55 million patient-hours of raw ICU telemetry, turns them into a queryable data warehouse, engineers a 289-feature predictive representation of each patient-hour, trains and rigorously validates a gradient-boosted model against that target, and then stress-tests the result from every angle a clinical deployment would actually need answered: does it generalize across hospitals, is it fair across patient subgroups, does it know when it's uncertain, and what does it actually buy a nurse at the bedside compared to the rule-of-thumb screening already in use. A later Phase 6 extension (§4) then asks a different question of the same problem: does a deep sequence model — GRU-D, TabNet, or a causal Transformer — actually beat the gradient-boosted tree, or does this dataset reproduce the broader finding that trees are hard to beat on tabular clinical data at this scale?
 
 > **On the title:** this is named *"...Sepsis Onset..."*, not the broader *"...Patient Deterioration..."*, because that is precisely what `SepsisLabel` — the target variable — measures. Calling it "deterioration" would overstate what the model is trained on.
 
@@ -65,11 +65,22 @@ raw PhysioNet .psv files (one per patient)
         ├──► 09_hierarchical_clustering.py →  Ward-linkage phenotype search
         ├──► 11_dbscan_clustering.py     →  density-based phenotype search
         ├──► 10_classical_classifiers.py →  Decision Tree + Naive Bayes, raw vs. engineered
-        └──► 12_outlier_analysis.py      →  IQR fencing + Isolation Forest vs. SepsisLabel
+        ├──► 12_outlier_analysis.py      →  IQR fencing + Isolation Forest vs. SepsisLabel
+        │
+        │    ── Phase 6a: does attention beat trees on this same feature table? ──
+        └──► 17_tabnet_model_kaggle.py   →  TabNet, same 289 features as script 04
+
+01_etl_warehouse.py's fact_vitals_hourly (raw, pre-script-02)
+        │
+        │    ── Phase 6b/6c: can a network learn the missingness signal itself? ──
+        ├──► 16_grud_model.py            →  GRU-D, learned per-vital missingness decay
+        └──► 18_transformer_model.py     →  causal self-attention over the raw stay
 
 delong.py         (shared) statistical test for comparing two correlated AUROCs
 utility_score.py  (shared) PhysioNet Challenge's own clinical utility metric
 ```
+
+Scripts 16–18 are a later addition ("Phase 6" in the scripts' own header comments) that swap in three deep-learning architectures as direct challengers to the XGBoost engineered model, reusing the same `utility_score.py`/`delong.py` evaluation contract throughout. `17_tabnet_model_kaggle.py` is a drop-in *model* swap — it reads the exact same 289-column `fact_features` table script 04 uses. `16_grud_model.py` and `18_transformer_model.py` instead read straight from `fact_vitals_hourly` (raw, pre-script-02) on purpose, since the whole point of both is to test whether a network can learn the missingness/staleness signal script 02 hand-computed in SQL, rather than being handed it as a feature.
 
 Everything downstream of `01_etl_warehouse.py` reads from the DuckDB warehouse, never the raw `.psv` files directly — this keeps every later step fast and lets DuckDB's vectorized SQL engine (window functions, joins, aggregations) do the heavy lifting instead of row-by-row pandas code.
 
@@ -95,17 +106,24 @@ sepsis_capstone/
 │   ├── 13_fairness_audit.py                   subgroup AUROC/AUPRC/utility audit
 │   ├── 14_cross_hospital_generalization.py    train-on-one/test-on-other hospital
 │   ├── 15_conformal_prediction.py             MAPIE split-conformal uncertainty sets
+│   ├── 16_grud_model.py                       GRU-D recurrent model (learned missingness decay)
+│   ├── 17_tabnet_model_kaggle.py              TabNet, local dev run (35% patient subsample)
+│   ├── 17_tabnet_model_kaggle (full).py       TabNet, full 1.55M-row Kaggle GPU run
+│   ├── 18_transformer_model.py                causal self-attention Transformer over raw vitals
 │   ├── clustering_phenotypes.py               k-means clustering
 │   ├── delong.py                              DeLong's test (AUROC comparison)
 │   └── utility_score.py                       PhysioNet Challenge 2019 utility metric
 ├── outputs/
 │   ├── *.csv               metrics, cluster profiles, rule tables, OLAP demo tables, fairness/
-│   │                        cross-hospital/conformal summaries
-│   ├── *.parquet           out-of-fold predictions for every model, for independent
-│   │                        metric verification without re-training
-│   ├── run*_log.txt        captured stdout from each script run
+│   │                        cross-hospital/conformal/GRU-D/TabNet/Transformer summaries
+│   ├── *.parquet           out-of-fold / held-out test predictions for every model, for
+│   │                        independent metric verification without re-training
+│   ├── run*_log.txt        captured stdout from each script run (run16/17/18 for the
+│   │                        deep-learning scripts; `run17_log(full).txt` for the Kaggle run)
 │   ├── figures/            SHAP plots, dendrogram, silhouette plot, DBSCAN elbow,
 │   │                        outlier-lift chart, fairness-audit chart
+│   │                        (scripts 16–18 report their results as tables/logs only — see
+│   │                        §7 for why no new figures were added for these three)
 │   └── powerbi_export/     dim_patient.csv, dim_hospital.csv, fact_vitals_olap.csv
 ├── warehouse/
 │   └── sepsis.duckdb       (gitignored — rebuilt locally by 01_etl_warehouse.py)
@@ -509,6 +527,84 @@ Wraps the engineered XGBoost model with **split conformal prediction** (via [MAP
 
 **Restricting to confident predictions raises clinical utility by ~20%:** normalized utility on the confident-only subset (0.3871) is notably higher than on the full test cohort (0.3217 — itself consistent with the 0.3203 in-distribution result from `04_engineered_model.py`, a useful cross-check that this held-out split reproduces the earlier headline number). This suggests a two-tier alerting design in practice: act automatically on the ~83% of hours the model is sure about, and route the ~17% flagged as uncertain to clinician review rather than trusting the point estimate blindly. The empty-set rate of exactly 0.00% also confirms the conformal procedure never produces a degenerate "neither label is plausible" output, which would be hard to act on operationally.
 
+### Phase 6 — does a bigger/fancier model actually beat the tree?
+
+Scripts 1–15 answer the core capstone brief with one model family (XGBoost) plus two classical baselines (Decision Tree, Naive Bayes). Scripts 16–18 are a later, self-contained extension that puts three deep-learning architectures up against that same XGBoost engineered model, each one chosen to test a *specific* hypothesis raised earlier in the project rather than "try a neural net and see":
+
+| Script | Architecture | Question it answers | Reads from |
+|---|---|---|---|
+| `16_grud_model.py` | GRU-D (Che et al., 2018) | Can a network *learn* the missingness-decay signal `02_feature_engineering.py` hand-computed as `hours_since_last_X`, instead of being handed it? | `fact_vitals_hourly` (raw, 34 cols) |
+| `17_tabnet_model_kaggle.py` | TabNet (Arik & Pfister, 2021) | Does learned sparse attention over tabular columns beat gradient-boosted trees on the *exact same* 289-feature table? | `fact_features` (same 289 cols as script 04) |
+| `18_transformer_model.py` | Causal Transformer encoder (Vaswani et al., 2017) | Does full self-attention over the whole stay-so-far beat a recurrent hidden state at finding sepsis-relevant patterns? | `fact_vitals_hourly` (raw, 34 cols) |
+
+All three reuse `utility_score.py` and `delong.py` exactly as scripts 03–15 do, and all three still split by `patient_id` — but GRU-D and the Transformer use a 70/15/15 patient-level train/val/test split (not `GroupKFold`) because early-stopping a backprop-through-time model needs a held-out validation set that k-fold CV doesn't provide.
+
+**Compute-constraint disclosure, stated once here rather than three times below:** a full `GroupKFold(5)`, refit-per-fold, over all ~40,336 patients is not tractable for either backprop-through-time recurrence (GRU-D) or O(T²) self-attention (Transformer) on commodity hardware — the same class of constraint already disclosed for `09_hierarchical_clustering.py`'s Ward-linkage subsample. GRU-D and the Transformer are therefore both trained on the **same** stratified random subsample of 8,000 patients (seed=42, stratified on `is_ever_septic`, identical helper function to script 09), so the two are compared to each other on identical patients as well as both being compared to XGBoost. TabNet doesn't share this constraint the same way — it needed a *row*-subsample only for local development iteration speed, and was subsequently run on the full 1,552,210-row table on a Kaggle GPU once the actual bottleneck was found (see below), so its headline number is a full-population result like every XGBoost table in this README.
+
+#### `16_grud_model.py` — GRU-D: does a recurrent net learn the missingness signal end-to-end?
+
+GRU-D augments a GRU cell with a learned per-variable decay term, `gamma_x = exp(-relu(W_x · delta + b_x))`, that decides at every hour how much to still trust a variable's last observed value given how long ago (`delta`, hours) it was measured — decaying the imputed value toward the population mean the longer a lab has gone unmeasured. This is the same underlying idea as `Lactate_hours_since_last`, but *learned* as part of the architecture rather than hand-computed in SQL, so this script is a direct end-to-end test of whether the network rediscovers script 05's SHAP finding that `Lactate_hours_since_last` (rank #3) and `Bilirubin_total_hours_since_last` (rank #6) outrank most raw vital-sign features.
+
+| | |
+|---|---|
+| Train / val / test patients | 5,600 / 1,200 / 1,200 |
+| Raw features | 34 (8 vitals + 26 labs, no engineered columns) |
+| Epochs run (of 20 max) | 16 (early-stopped on val AUPRC, patience 4) |
+| **Test AUROC** | **0.7404** |
+| Test AUPRC | 0.0541 |
+| Best-threshold normalized utility | 0.2415 (threshold 0.58) |
+
+**DeLong's test vs. XGBoost, on the identical 1,200-patient test subsample (46,561 paired predictions):** XGBoost engineered AUROC 0.7708 → GRU-D 0.7404, z=3.11, p=0.0018 — a statistically real gap, XGBoost still wins. (0.7708 here is the engineered model's score restricted to just this subsample's test hours, not its 0.7918 full-population headline — this is an apples-to-apples comparison on the same rows, not a comparison against the number quoted everywhere else in this README.)
+
+**Did the network rediscover the SHAP missingness ranking? Only partially — reported honestly rather than rounded up to a clean story.** Ranking all 34 vitals/labs by their learned decay rate (lower `gamma_x` = the network decays that variable's stale readings faster, i.e. treats freshness as more urgent):
+
+| Fastest-decaying (most freshness-sensitive) | `gamma_x` | | Slowest-decaying (~never decays) | `gamma_x` |
+|---|---|---|---|---|
+| `Bilirubin_direct` | 0.042 | | `Temp` | 1.000 |
+| `Potassium` | 0.043 | | `Phosphate` | 1.000 |
+| `Glucose` | 0.044 | | `FiO2` | 1.000 |
+| `DBP` | 0.058 | | `BaseExcess` | 1.000 |
+| `SaO2` | 0.072 | | `TroponinI` | 1.000 |
+
+`Lactate` lands at **rank #10/34** by decay speed (`gamma_x` = 0.325) and `Bilirubin_total` at **#11/34** (`gamma_x` = 0.481) — real signal (both decay meaningfully faster than the 22 variables pinned near `gamma_x` ≈ 1.0, which the network has essentially learned to treat as "trust the last value indefinitely"), but not the #3/#6 model-wide dominance SHAP found for their hand-computed `hours_since_last` counterparts. The two methods agree on the qualitative point — recency-of-measurement for a handful of labs (not vitals) carries learnable signal — but disagree on exactly which labs matter most: GRU-D's top-5 are dominated by metabolic/electrolyte labs (`Bilirubin_direct`, `Potassium`, `Glucose`) rather than `Lactate` specifically. Plausible reasons this isn't a clean replication rather than a contradiction: GRU-D's decay term is fit jointly with a much smaller model on 27× fewer patients than the SHAP analysis's full-population XGBoost fit, and it only ever sees the *raw* signal, never the actual `_hours_since_last` feature engineering that gave SHAP such a direct hook to attribute credit to. This is reported as a partial, not full, corroboration — the same reporting-outcomes-honestly standard already applied to the null clustering result in §4.
+
+#### `17_tabnet_model_kaggle.py` — TabNet: does attention beat trees on the same feature table?
+
+A deliberate model-only swap: TabNet reads the identical 289-column `fact_features` table, the identical patient-grouped `GroupKFold(5)`, and is scored with the identical utility metric and DeLong helper script 04 uses — no new SQL, no new feature engineering. The question is treated as genuinely open rather than assumed: does learned sparse attention over tabular columns beat gradient-boosted trees here, or does this dataset reproduce the well-published finding that GBTs tend to beat deep tabular architectures at moderate sample sizes (Shwartz-Ziv & Armon, 2022)?
+
+Two runs exist because of a real debugging story worth documenting rather than hiding: an initial full-table attempt took ~2 hours instead of an expected ~20 minutes. Profiling (the `[timing]` log lines below) traced this to two silent bottlenecks that have nothing to do with GPU compute — an unlogged `np.nanmedian` call over a ~1M-row × 289-col array (swapped for `bottleneck`'s faster implementation) and `patient_id` being carried as an object-dtype string array through every `GroupKFold`/`np.unique`/`np.isin` call (fixed by factorizing to `int32` first). A third, larger bottleneck was found afterward: `pytorch-tabnet`'s `fit()` silently runs an extra full forward pass over the *entire* training fold at the end of every fold to compute feature importances (`compute_importance=True` by default), which alone cost 500–600 seconds per fold on the full table — longer than the training loop itself. The full-table run below sets `compute_importance=False` and instead computes importances itself via the same public `explain()` API, on a 10% subsample of each fold's training rows, averaged across folds.
+
+| Run | Rows | Patients (OOF) | AUROC | AUPRC | Best-threshold utility | vs. XGBoost DeLong (z, p) |
+|---|---|---|---|---|---|---|
+| Local dev run (`ROW_SUBSAMPLE_FRAC=0.35`, pre-fix) | 545,863 | 14,157 | 0.7089 | 0.0560 | 0.2123 (thr. 0.54) | z=30.62, p≈0 |
+| **Full table (Kaggle T4×2 GPU, post-fix)** | **1,552,210** | **40,336** | **0.7597** | **0.0640** | **0.2687 (thr. 0.58)** | **z=29.96, p≈0** |
+| XGBoost engineered (script 04, for reference) | 1,552,210 | 40,336 | 0.7918 | 0.0821 | 0.3203 | — |
+
+The full-table run is the number to treat as TabNet's actual result: it uses the same population as every other headline figure in this README, and per-fold timing on it (`fit≈250–272s`, `predict≈3.6s`, `feature_importances≈8s`) confirms the two root-caused bottlenecks — not GPU/RAM budget — were what made the earlier full-table attempt slow. The 0.35-subsample run is kept in the repo and reported here for transparency (it's what informed the debugging), not as a second independent result to average with the first.
+
+**On the full table, TabNet lands above the raw baseline (0.7572) but clearly below the engineered XGBoost model (0.7918)** — DeLong's test rejects "no difference" overwhelmingly (z≈30, p≈0) in XGBoost's favor either way the table is sliced. This is the expected, well-published outcome for a deep tabular architecture against a tuned GBT at this sample size, not a surprise: TabNet's own comparison in Arik & Pfister (2021) shows a similar pattern on several benchmarks, and the finding here is an independent confirmation on real clinical data rather than a contradiction of TabNet's design.
+
+**Feature-attention agreement with SHAP is real but modest.** Both the subsampled and full-table runs put `Lactate_hours_since_last` and `Bilirubin_total_hours_since_last` — the same two missingness features SHAP ranked #3 and #6 model-wide — inside TabNet's own top 4 by attention-mask importance, which is a genuine point of agreement between two structurally different attribution methods. But the rank correlation across all 289 shared features is weak (Spearman ρ=0.189, p=0.0012 on the full run — statistically non-zero, but far from strong agreement), and only 4 of the top-15 features overlap between the two rankings. Read together with `16_grud_model.py`'s partial-replication result above, both deep architectures independently confirm that lab-recency is *a* real signal, without independently reproducing SHAP's *precise* ranking of it — a consistent, honest pattern across two unrelated deep models rather than an isolated fluke in either one.
+
+#### `18_transformer_model.py` — Transformer: does whole-stay attention beat recurrence?
+
+A causally-masked Transformer encoder that can attend from hour *t* directly back to any earlier hour in one layer, instead of routing information through *T* sequential GRU updates the way GRU-D must. To keep the three deep architectures' relationship to the missingness signal distinct and comparable, this script's input construction differs from both other deep models on purpose: it feeds the raw delta tensor (hours-since-last-observed — the same tensor script 16 computes) plus a binary mask directly into the attention mechanism, with no decay function assumed and no hand-computed missingness feature engineering — whatever the model does with staleness here, it worked out from `delta`/`mask` alone. It uses the exact same 8,000-patient stratified subsample and 70/15/15 split as `16_grud_model.py`, specifically so the GRU-D-vs-Transformer comparison is exact (same test patients), not merely similar.
+
+| | |
+|---|---|
+| Model parameters | 73,601 |
+| Train / val / test patients | 5,600 / 1,200 / 1,200 (identical to script 16) |
+| Epochs run (of 20 max) | 6 (early-stopped on val AUPRC, patience 4) |
+| **Test AUROC** | **0.7839** |
+| Test AUPRC | **0.1032** |
+| Best-threshold normalized utility | 0.3227 (threshold 0.62) |
+
+**This is the one deep model that is not clearly beaten by XGBoost — reported carefully, given the small test set.** DeLong's test against XGBoost's engineered model on the identical 1,200-patient subsample (46,561 paired predictions) gives AUROC 0.7708 (XGBoost) → 0.7839 (Transformer), **z=−1.54, p=0.123** — numerically higher for the Transformer, but *not* a statistically significant difference at conventional thresholds. The honest reading is "not distinguishable from XGBoost on this subsample," not "beats XGBoost": p=0.123 means the observed +0.013 AUROC gap is well within what sampling noise on a 1,200-patient test set could produce. What *is* statistically decisive is the Transformer's comparison against the other deep model trained on the identical data: **AUROC 0.7404 (GRU-D) → 0.7839 (Transformer), z=−4.99, p=6.1×10⁻⁷** — on this subsample, whole-stay self-attention is a clearly better architecture than GRU-D's recurrent decay mechanism for this task, even though neither can be shown to beat the tree model outright.
+
+**Attention is heavily recency-biased, and that's an independent confirmation of the ablation finding from §4.** Averaging the last encoder layer's self-attention weights by relative lag (how many hours back a query attends to) shows a smooth, monotonic decay: lag 0 (the current hour) receives the most attention (mean weight 0.108), falling to 0.081 at lag 1h, 0.070 at lag 2h, and continuing to decline through the 300-hour range logged. The model was free to attend anywhere in the stay so far and chose to concentrate most heavily on the most recent few hours — independently arriving, via a completely different mechanism (learned attention weights rather than hand-designed window functions), at the same conclusion `04_engineered_model.py`'s ablation already established: `rolling_stats` over short recent windows (3h/6h/12h) carry the great majority of the predictive signal in this problem, and looking much further back adds comparatively little.
+
+**Caveat carried into the results summary and limitations below:** the Transformer's strong showing is measured on the same 1,200-patient held-out subsample as GRU-D, not on the full 40,336-patient population XGBoost's 0.7918 headline reflects — a materially smaller and differently-composed test set. This result is genuinely promising and worth a follow-up full-scale run, but it should not be read as "the Transformer beats XGBoost outright"; it should be read as "on a fair, matched, apples-to-apples comparison against XGBoost restricted to the same patients, the Transformer was competitive and the difference was not statistically significant," which is a meaningfully different and more modest claim.
+
 ### `delong.py` and `utility_score.py` — shared helper modules
 
 - **`delong.py`** implements DeLong's test for comparing two correlated AUROCs (used by `04_engineered_model.py`) — the statistically correct way to compare two models' AUROC on the *same* test set, since a naive "0.79 > 0.76, so it's better" comparison ignores that both numbers carry sampling uncertainty.
@@ -554,8 +650,15 @@ Three categories of leakage were explicitly checked and are documented — inclu
 | Conformal uncertain-hour flag rate | 16.56% of hours |
 | Accuracy: confident vs. uncertain hours (conformal) | 87.71% vs. 57.52% |
 | Utility, confident-only subset vs. full cohort (conformal) | 0.3871 vs. 0.3217 (+~20%) |
+| TabNet (full 1.55M-row table) vs. XGBoost engineered | AUROC 0.7597 vs. 0.7918 (XGBoost wins, DeLong z≈30, p≈0) |
+| GRU-D vs. XGBoost (matched 1,200-patient subsample) | AUROC 0.7404 vs. 0.7708 (XGBoost wins, z=3.11, p=0.0018) |
+| Transformer vs. XGBoost (matched 1,200-patient subsample) | AUROC 0.7839 vs. 0.7708 (not significant, z=−1.54, p=0.123) |
+| Transformer vs. GRU-D (identical subsample/split) | AUROC 0.7839 vs. 0.7404 (Transformer wins, z=−4.99, p=6.1e-07) |
+| Deep-model missingness replication of SHAP ranking | Partial: `Lactate`/`Bilirubin_total` recency matters to both GRU-D and TabNet, but neither reproduces SHAP's exact #3/#6 ranking |
 
 **Reading these together:** the single headline AUROC (0.7918) understates how unevenly this model performs across hospital sites and, to a lesser extent, age groups, and it overstates how well the model would perform at a hospital it wasn't trained on. Conformal prediction offers a partial mitigation — not for the fairness gap itself, but for the more general problem of not knowing which individual predictions to trust — by explicitly separating "confident enough to act on" from "needs a second opinion," which is a meaningfully more honest deployment pattern than a single shared probability threshold.
+
+**On the Phase 6 deep-learning comparison specifically:** the headline conclusion is that gradient-boosted trees remain the right model choice for this table at this scale — TabNet, evaluated on the full population, loses to XGBoost by a wide and statistically decisive margin, consistent with the published literature on tabular deep learning. GRU-D, on a smaller matched subsample, also loses to XGBoost decisively. The one genuinely open result is the Transformer, which was statistically indistinguishable from XGBoost on a matched 1,200-patient subsample — encouraging enough to be worth a full-population re-run, but not yet a result that would justify replacing the tree model in this project's headline numbers.
 
 ---
 
@@ -575,6 +678,12 @@ These are stated plainly rather than smoothed over, along with why each one is w
 - **The 75+ age group is both the worst-served and arguably the highest-stakes group.** A 0.02 AUROC gap sounds small in isolation, but it's the largest age-bracket gap observed, on the subgroup where a missed sepsis alert plausibly carries the most clinical risk — worth flagging explicitly rather than averaging it away in an overall AUROC.
 - **The conformal guarantee is marginal, not conditional.** The 90% coverage guarantee from `15_conformal_prediction.py` holds on average across the whole calibration/test distribution, not provably per-subgroup. Given the fairness gaps found in §4/§6, it would be worth checking in a follow-up analysis whether coverage holds equally well within each hospital/age subgroup, or whether the "uncertain" flag is itself unevenly distributed across those same groups — this hasn't been checked yet, and is flagged here rather than assumed away.
 - **This is real clinical data, but a research pipeline, not a validated clinical product.** Every result above should be read as evidence for what's learnable from this dataset with this methodology, not as a claim of readiness for bedside deployment — cross-hospital generalization, subgroup fairness, and label-construction leakage are all reasons a real deployment would need substantially more validation than what's shown here.
+- **Two of the three Phase 6 deep models (`16_grud_model.py`, `18_transformer_model.py`) are evaluated on an 8,000-patient subsample, not the full 40,336-patient population.** Backprop-through-time recurrence and O(T²) self-attention are both substantially more memory- and compute-intensive per training step than XGBoost's tree building, so a full patient-grouped k-fold refit for either isn't tractable at this project's compute budget. The subsample uses the same stratified-by-`is_ever_septic` helper already established (and disclosed) for `09_hierarchical_clustering.py`'s Ward-linkage run, so the sepsis rate is preserved exactly (7.27% in both the full population and the subsample) — but a 1,200-patient held-out test set is a smaller, higher-variance basis for a DeLong comparison than the 40,336-patient comparisons used everywhere else in this README, and its result should be weighted accordingly. `17_tabnet_model_kaggle.py` does not share this constraint — its headline number is a full-population run — because a tabular model without a recurrent/attention time dimension over a full ICU stay is comparatively cheap to train even on the full row count once its actual bottlenecks (below) were fixed.
+- **The Transformer's near-parity with XGBoost (§4, §6) is a promising but unconfirmed result, not a validated one.** It rests on a statistically non-significant comparison (p=0.123) on a 1,200-patient test set — a result this size could plausibly move in either direction with a different random subsample or a full-population re-run. It's reported prominently here because it's genuinely the most interesting Phase 6 finding, not because it's been confirmed at the same evidentiary standard as the XGBoost-vs-baseline result (which rests on 1.55M paired predictions and a DeLong p-value of effectively zero).
+- **GRU-D's learned decay ranking only partially matches SHAP's missingness-importance ranking (§4).** `Lactate` and `Bilirubin_total` decay meaningfully faster than most other variables (real signal), but rank #10 and #11 of 34 rather than reproducing SHAP's #3/#6 dominance. This is reported as a partial, not full, replication rather than rounded up to "GRU-D confirms the SHAP finding" — the two methods agree on the general phenomenon (lab recency matters) without agreeing on its precise ranking, plausibly because GRU-D is fit on far fewer patients, with a much smaller model, and never sees the actual `hours_since_last` feature SHAP was attributing credit to.
+- **`torch`, `pytorch-tabnet`, and `bottleneck` are not yet in `requirements.txt`.** Scripts 16–18 depend on PyTorch (16, 18) or `pytorch-tabnet`/`bottleneck` (17), none of which are declared alongside the DuckDB/XGBoost/sklearn stack the rest of the pipeline needs — `16_grud_model.py` fails fast with an explicit, actionable error message if PyTorch isn't installed, rather than a confusing stack trace, but this is a packaging gap that should be closed (with CPU-only PyTorch wheels, per the same script's own comment, so scripts 16 and 18 don't force a CUDA install on machines that don't have or need a GPU).
+- **`17_tabnet_model_kaggle.py`'s full-table run needs a Kaggle GPU notebook, not this repo's local environment.** The local dev run (`ROW_SUBSAMPLE_FRAC=0.35`) is what's reproducible by running the script as-is; the full-population headline number requires uploading `sepsis.duckdb` plus `utility_score.py`/`delong.py` as a private Kaggle Dataset and running the `(full)` variant there with a GPU accelerator turned on (see the script's own header for the exact steps). This is disclosed rather than smoothed over because it means the full-population TabNet number in this README is not reproducible from a single `python src/17_tabnet_model_kaggle.py` call the way every other headline number in this project is.
+- **No plots were generated for scripts 16–18.** Every other script that produces a standalone visual finding (SHAP, clustering, DBSCAN, outliers, fairness) saves a figure to `outputs/figures/`. The three Phase 6 scripts report their results as tables and log lines only — the GRU-D decay-rate ranking and the Transformer's attention-by-lag curve are both good candidates for a bar chart / line plot in a future pass, but weren't prioritized here since the tabular form was sufficient to state the findings precisely.
 
 ---
 
@@ -599,10 +708,20 @@ python src/12_outlier_analysis.py
 python src/13_fairness_audit.py
 python src/14_cross_hospital_generalization.py
 python src/15_conformal_prediction.py
+
+# Phase 6 -- deep-learning comparison (optional; needs torch / pytorch-tabnet,
+# not yet in requirements.txt -- see the note below)
+python src/16_grud_model.py
+python src/18_transformer_model.py
+python src/17_tabnet_model_kaggle.py     # local dev run, ROW_SUBSAMPLE_FRAC=0.35
+#   (the full-population TabNet number instead needs the "(full)" variant run
+#   on a Kaggle GPU notebook -- see 17_tabnet_model_kaggle.py's own header for
+#   the exact upload/settings steps; it is not reproducible with a plain
+#   `python` call the way every other script in this list is)
 ```
 
-Install dependencies first with `pip install -r requirements.txt` (this includes `mapie>=1.0`, needed only by script 15 but included so the whole pipeline installs cleanly in one pass).
+Install dependencies first with `pip install -r requirements.txt` (this includes `mapie>=1.0`, needed only by script 15 but included so the whole pipeline installs cleanly in one pass). **Scripts 16–18 need `torch` (16, 18) and `pytorch-tabnet` + `bottleneck` (17) as well, and none of these three are in `requirements.txt` yet** (§7) — install them separately, e.g. `pip install torch --index-url https://download.pytorch.org/whl/cpu` (CPU is enough for scripts 16/18's subsampled scale) and `pip install pytorch-tabnet bottleneck` for script 17's local run.
 
-Scripts 10–12 only depend on `02_feature_engineering.py` having already built `fact_features`/`fact_ffill` — they don't need scripts 03–09 to have run first, so they can be run any time after step 2 if you just want to check them in isolation. Scripts 13–15 depend on `04_engineered_model.py`'s trained model and out-of-fold predictions, so run those after script 04.
+Scripts 10–12 only depend on `02_feature_engineering.py` having already built `fact_features`/`fact_ffill` — they don't need scripts 03–09 to have run first, so they can be run any time after step 2 if you just want to check them in isolation. Scripts 13–15 depend on `04_engineered_model.py`'s trained model and out-of-fold predictions, so run those after script 04. Scripts 16 and 18 only need `01_etl_warehouse.py` (they read raw `fact_vitals_hourly`, not the engineered table), but both look for `outputs/engineered_oof_predictions.parquet` to run their DeLong's-test comparison against XGBoost, so run script 04 first if you want that comparison rather than just the standalone AUROC/AUPRC. Script 18 additionally looks for `outputs/grud_results.csv`, so run script 16 before script 18 if you want the GRU-D-vs-Transformer DeLong comparison. Script 17 needs `02_feature_engineering.py`'s `fact_features` table, same as script 04, but does not depend on script 04 itself running first (only on its *output* being present for the optional DeLong comparison).
 
 For the Power BI half of the OLAP demonstration (importing `outputs/powerbi_export/*.csv` and building the interactive roll-up/drill-down/slice/dice visuals), see `POWERBI_HANDOFF.md`.
