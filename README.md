@@ -1,28 +1,32 @@
 # Sepsis Onset Early Warning
 
-**An end-to-end clinical machine-learning pipeline for predicting sepsis onset from hourly ICU physiological data, with temporal feature engineering, statistical model comparison, early-warning analysis, explainability, generalization, fairness, uncertainty, phenotype discovery, and deep-learning challengers.**
+**An end-to-end clinical machine-learning pipeline for predicting sepsis onset from hourly ICU physiological data, with temporal feature engineering, statistical model comparison, early-warning analysis, explainability, generalization, fairness, uncertainty, calibration, phenotype discovery, and deep-learning challengers.**
 
 > **Status:** Research / retrospective benchmark. This repository is not a clinically validated diagnostic or treatment system.
 
 ## Executive summary
 
-This project builds a complete early-warning pipeline around the PhysioNet/Computing in Cardiology Challenge 2019 ICU dataset. The workflow starts from hourly patient telemetry, converts the raw records into a DuckDB analytical warehouse, constructs causal temporal features, trains and evaluates multiple model families, and then examines whether the resulting predictor is useful beyond a single AUROC number.
+This project builds a complete early-warning pipeline around the PhysioNet/Computing in Cardiology Challenge 2019 ICU dataset. The workflow starts from hourly patient telemetry, converts the raw records into a DuckDB analytical warehouse, constructs causal temporal features, trains and evaluates multiple model families, and then examines discrimination, clinical utility, early warning, alarm burden, explainability, generalization, fairness, uncertainty, and probability calibration.
 
-The central modeling result is a **289-feature XGBoost model** that improves on a 15-feature raw snapshot baseline:
+The main engineered representation contains **289 predictive features** and improves substantially over the 15-feature raw snapshot baseline.
 
-| Model | AUROC | AUPRC | Normalized utility |
-|---|---:|---:|---:|
-| Raw XGBoost baseline | 0.7572 | 0.0634 | 0.2504 |
-| **Engineered XGBoost** | **0.7918** | **0.0821** | **0.3203** |
-| Decision Tree, engineered | 0.7152 | 0.0540 | 0.2065 |
-| Naive Bayes, engineered | 0.7093 | 0.0387 | 0.1431 |
-| TabNet, full OOF run | 0.7597 | 0.0640 | 0.2687 |
-| GRU-D, 20k-patient test | 0.7605 | 0.0661 | 0.2854 |
-| **Causal Transformer, 20k-patient test** | **0.8230** | **0.1349** | **0.3809** |
+### Current results from the retained `outputs/` run
 
-The most important conclusion is therefore nuanced: **the engineered XGBoost model is a strong and interpretable tabular baseline, but the later Transformer experiment is the strongest reported model in this repository under its matched 20,000-patient test protocol.** The Transformer result should not be treated as directly interchangeable with the full-population XGBoost OOF number because the evaluation populations and protocols differ; the repository therefore reports paired DeLong comparisons on the shared 3,000-patient deep-learning test set.
+| Model | Evaluation protocol | AUROC | AUPRC | Normalized utility |
+|---|---|---:|---:|---:|
+| Raw XGBoost baseline | full-population 5-fold patient-grouped OOF | 0.7572 | 0.0634 | 0.2504 |
+| **Engineered XGBoost** | full-population 5-fold patient-grouped OOF | **0.7926** | **0.0834** | **0.3202** |
+| Decision Tree, engineered | full-population grouped OOF | 0.7152 | 0.0540 | 0.2065 |
+| Naive Bayes, engineered | full-population grouped OOF | 0.7093 | 0.0387 | 0.1431 |
+| TabNet | full-population 5-fold OOF | 0.7597 | 0.0640 | 0.2687 |
+| GRU-D | full-population patient-level 70/15/15 split | 0.7387 | 0.0591 | 0.2374 |
+| **Causal Transformer** | full-population patient-level 70/15/15 split | **0.8095** | **0.0984** | **0.3597** |
 
-The project also shows that the predictive signal is not only the instantaneous value of a vital sign. Temporal behavior, recent laboratory history, measurement frequency, and derived physiological relationships matter. For example, `Lactate_max_12h` is the strongest SHAP feature, while `Lactate_hours_since_last` ranks third, demonstrating that both **what was measured** and **when it was last measured** carry signal.
+The most defensible current conclusion is deliberately narrower than the earlier README: **engineered XGBoost is a strong tabular baseline, while the causal Transformer is the strongest model in the current held-out deep-learning experiment.** The XGBoost and deep-learning numbers come from different evaluation contracts and should not be treated as one interchangeable leaderboard.
+
+A major new result is **post-hoc calibration**. Raw model scores are substantially overconfident because of the class-weighted training setup. Platt scaling, fit on a separate patient-level calibration split and evaluated on untouched patients, reduces Brier scores from roughly **0.1365–0.1977 to 0.0167–0.0173** while leaving AUROC unchanged. This improves the interpretation of the outputs as probabilities, but it does **not** automatically improve the PhysioNet utility score at the old operating point; threshold selection must be redone after calibration.
+
+The project also shows that predictive signal is not only the instantaneous value of a vital sign. Temporal behavior, recent laboratory history, measurement frequency, and derived physiological relationships matter. `Lactate_max_12h` is the strongest SHAP feature, while `Lactate_hours_since_last` is third, demonstrating that both **what was measured** and **when it was last measured** carry signal.
 
 ---
 
@@ -60,7 +64,7 @@ The warehouse contains:
 
 `BaseExcess`, `HCO3`, `FiO2`, `pH`, `PaCO2`, `SaO2`, `AST`, `BUN`, `Alkalinephos`, `Calcium`, `Chloride`, `Creatinine`, `Bilirubin_direct`, `Glucose`, `Lactate`, `Magnesium`, `Phosphate`, `Potassium`, `Bilirubin_total`, `TroponinI`, `Hct`, `Hgb`, `PTT`, `WBC`, `Fibrinogen`, `Platelets`
 
-The data are sparse, particularly for laboratory variables. Rather than treating missingness as something to erase, the pipeline explicitly models it because the fact that a test was or was not recently measured can itself contain clinical information.
+The data are sparse, particularly for laboratory variables. Rather than treating missingness as something to erase, the pipeline explicitly models it because the fact that a test was or was not recently measured can itself contain information associated with the target.
 
 ---
 
@@ -94,17 +98,23 @@ XGBoost             XGBoost                      Power BI tables
        │
        ├────────────── classical models / clustering / outliers / rules
        │
-       └────────────── Phase 6 deep-learning challengers
+       └────────────── deep-learning challengers
                          ├── 16 GRU-D
                          ├── 17 TabNet
                          └── 18 causal Transformer
+
+19 recalibration
+       │
+       ├── Platt scaling
+       ├── held-out calibration diagnostics
+       └── threshold re-lock
 
 Shared evaluation utilities:
     utility_score.py
     delong.py
 ```
 
-The architecture deliberately separates **data engineering**, **feature engineering**, **predictive modeling**, and **post-model analysis**. This makes it possible to answer different questions without confusing them:
+The architecture deliberately separates **data engineering**, **feature engineering**, **predictive modeling**, **post-model analysis**, and **calibration**. This makes it possible to answer different questions without confusing them:
 
 1. Can raw measurements predict sepsis?
 2. How much does temporal feature engineering add?
@@ -115,6 +125,9 @@ The architecture deliberately separates **data engineering**, **feature engineer
 7. How early does it warn?
 8. Does it reduce false alarms relative to a simple SIRS-style rule?
 9. Can sequential neural architectures beat the tabular model?
+10. Are the predicted probabilities actually calibrated?
+11. Does threshold selection remain valid after calibration?
+12. How sensitive is the Transformer to recent history?
 
 ---
 
@@ -125,7 +138,7 @@ src/
 ├── 01_etl_warehouse.py
 ├── 02_feature_engineering.py
 ├── 03_baseline_model.py
-├── 04_engineered_model.py
+├── 04_engineered_model_kaggle.py
 ├── 05_explainability.py
 ├── 06_leadtime_alarm_fatigue.py
 ├── 07_olap_and_export.py
@@ -137,10 +150,10 @@ src/
 ├── 13_fairness_audit.py
 ├── 14_cross_hospital_generalization.py
 ├── 15_conformal_prediction.py
-├── 16_grud_model.py
+├── 16_grud_model_kaggle.py
 ├── 17_tabnet_model_kaggle.py
-├── 17_tabnet_model_kaggle (full).py
-├── 18_transformer_model.py
+├── 18_transformer_model_kaggle.py
+├── 19_recalibration.py
 ├── clustering_phenotypes.py
 ├── delong.py
 └── utility_score.py
@@ -148,6 +161,7 @@ src/
 outputs/
 ├── model result CSVs
 ├── OOF / held-out prediction Parquet files
+├── calibration outputs
 ├── run logs
 ├── figures/
 └── powerbi_export/
@@ -155,6 +169,8 @@ outputs/
 warehouse/
 └── sepsis.duckdb   # generated locally; not required in source control
 ```
+
+The current source tree includes the newer **full-population Kaggle deep-learning scripts** and the new **Phase 10 recalibration script**. The older README references to `04_engineered_model.py`, `16_grud_model.py`, `18_transformer_model.py`, and a separate full TabNet filename are therefore outdated.
 
 ---
 
@@ -164,7 +180,7 @@ The first stage converts the raw patient files into a DuckDB star schema.
 
 ### `dim_hospital`
 
-One row per hospital system. The project treats each raw-data subdirectory as a hospital system and assigns a stable hospital identifier.
+One row per hospital system. Each raw-data subdirectory is treated as a hospital system and assigned a stable hospital identifier.
 
 ### `dim_patient`
 
@@ -184,7 +200,7 @@ This grain is important: almost every downstream predictive result ultimately an
 
 The main engineered representation contains **289 predictive features**.
 
-The key design principle is **causality**. Rolling calculations use windows ending at the current hour and never include future observations. Conceptually:
+The key design principle is **causality**. Rolling calculations use windows ending at the current hour and never include future observations.
 
 ```sql
 ROWS BETWEEN N PRECEDING AND CURRENT ROW
@@ -204,7 +220,7 @@ rather than a window that reaches into the future.
 
 ### Rolling statistics
 
-The rolling layer captures four complementary aspects of recent history:
+The rolling layer captures:
 
 - mean
 - standard deviation
@@ -214,23 +230,19 @@ The rolling layer captures four complementary aspects of recent history:
 
 The windows are **3 hours, 6 hours and 12 hours**.
 
-This is important because sepsis deterioration is not necessarily represented by one abnormal measurement. A sustained increase in respiratory rate, a falling pressure trajectory, or repeated abnormal laboratory values can be more informative than a single snapshot.
-
 ### Velocity / change features
 
-The pipeline also computes first differences so that the model can distinguish:
+The pipeline computes first differences so the model can distinguish:
 
 ```text
 stable abnormal value
 ```
 
-from
+from:
 
 ```text
 rapidly worsening value
 ```
-
-This is one reason the engineered model can outperform the raw snapshot baseline even when both use the same underlying physiological variables.
 
 ### Missingness features
 
@@ -239,7 +251,7 @@ Two forms of missingness are retained:
 - whether a measurement is missing now;
 - how many hours have passed since that variable was last observed.
 
-This becomes one of the project's most interesting findings: measurement timing itself is predictive.
+This becomes one of the project's most interesting findings: **measurement timing itself is predictive**.
 
 ### Clinical composites
 
@@ -258,13 +270,13 @@ These are intentionally partial because the available dataset does not provide e
 
 The baseline intentionally uses only the **15 raw forward-filled snapshot features**.
 
-It answers a clean control question:
+It answers:
 
 > How well can a gradient-boosted tree perform without temporal feature engineering?
 
-The evaluation uses **5-fold GroupKFold**, grouping on patient ID. This is critical because splitting individual hourly rows would allow hours from the same patient to appear in both training and validation data.
+The evaluation uses **5-fold GroupKFold**, grouping on patient ID. This prevents different hours from the same patient appearing in both training and validation folds.
 
-### Baseline result
+### Current baseline result
 
 | Metric | Result |
 |---|---:|
@@ -278,23 +290,27 @@ The baseline is already substantially better than random ranking, but the next s
 
 ---
 
-# 6. Main model: `04_engineered_model.py`
+# 6. Main model: `04_engineered_model_kaggle.py`
 
 The engineered model uses the full **289-feature predictive representation**.
 
-### Main result
+### Current result
 
 | Metric | Raw baseline | Engineered XGBoost | Change |
 |---|---:|---:|---:|
-| AUROC | 0.7572 | **0.7918** | +0.0347 |
-| AUPRC | 0.0634 | **0.0821** | +0.0186 |
-| Utility | 0.2504 | **0.3203** | +0.0699 |
+| AUROC | 0.7572 | **0.7926** | +0.0354 |
+| AUPRC | 0.0634 | **0.0834** | +0.0200 |
+| Utility | 0.2504 | **0.3202** | +0.0698 |
 
-The improvement is not merely numerical. The paired DeLong comparison reports:
+The retained output is `outputs/engineered_results.csv`.
 
-- ΔAUC = **−0.03466** when calculated as baseline minus engineered;
-- z = **−38.30**;
-- p ≈ **0** at the reported precision.
+The paired DeLong output in `engineered_results_with_baseline_comparison.csv` reports:
+
+- baseline AUC = **0.75719**
+- engineered AUC = **0.792558**
+- AUC difference (baseline − engineered) = **−0.03537**
+- z = **−37.46**
+- p reported as **0** at machine precision.
 
 The practical interpretation is straightforward: **temporal and missingness-aware representation adds substantial ranking and utility signal beyond the raw snapshot.**
 
@@ -302,21 +318,21 @@ The practical interpretation is straightforward: **temporal and missingness-awar
 
 # 7. Ablation study: where does the gain come from?
 
-The feature-family ablation is especially useful because it prevents the 289-feature model from becoming a black box whose improvement is simply attributed to “more features.”
+The feature-family ablation prevents the 289-feature model from becoming a black box whose improvement is simply attributed to “more features.”
 
 | Feature family | N | AUROC | AUPRC |
 |---|---:|---:|---:|
-| **Rolling statistics** | 180 | **0.7737** | **0.0695** |
-| Raw forward-filled | 15 | 0.7572 | 0.0634 |
-| Slopes / velocity | 60 | 0.7228 | 0.0557 |
-| Missingness | 30 | 0.7163 | 0.0618 |
-| Clinical ratios | 4 | 0.6561 | 0.0379 |
+| **Rolling statistics** | 180 | **0.7738** | **0.0698** |
+| Raw forward-filled | 15 | 0.7587 | 0.0636 |
+| Slopes / velocity | 60 | 0.7226 | 0.0555 |
+| Missingness | 30 | 0.7181 | 0.0637 |
+| Clinical ratios | 4 | 0.6559 | 0.0378 |
 
 ### Interpretation
 
-The most important individual feature family is clearly **rolling statistics**. They provide the strongest single-family AUROC and AUPRC.
+**Rolling statistics are the strongest single feature family.**
 
-However, the full model is better than every single family because the information is complementary. A patient can simultaneously have:
+The full model remains better than every individual family because the information is complementary. A patient can simultaneously have:
 
 - a high recent lactate;
 - a worsening temperature trajectory;
@@ -326,7 +342,7 @@ However, the full model is better than every single family because the informati
 
 The full model can combine these signals rather than choosing one representation.
 
-A particularly important methodological point is that a low single-family AUROC does **not** mean the family is useless. The missingness family, for example, is much stronger when combined with the physiological values than when used alone.
+A low single-family AUROC does **not** mean the family is useless. Missingness, for example, can become more informative when combined with physiological values.
 
 ---
 
@@ -335,8 +351,6 @@ A particularly important methodological point is that a low single-family AUROC 
 SHAP is used to inspect the fitted XGBoost model and identify which features contribute most strongly to predictions.
 
 ## Global SHAP ranking
-
-Top features by mean absolute SHAP value:
 
 | Rank | Feature |
 |---:|---|
@@ -356,11 +370,9 @@ Top features by mean absolute SHAP value:
 | 14 | `Resp_min_12h` |
 | 15 | `Potassium_mean_12h` |
 
-### The important finding
+`Lactate_hours_since_last` being third overall is strong evidence that **measurement timing carries predictive information**.
 
-`Lactate_hours_since_last` being third overall is one of the strongest pieces of evidence in the project that **measurement timing carries predictive information**.
-
-This does not mean “a missing lactate causes sepsis.” It means the pattern of laboratory observation contains information associated with the target in this dataset. That can reflect clinical monitoring intensity and workflow as well as physiology.
+This does not mean “a missing lactate causes sepsis.” It means that the pattern of laboratory observation contains information associated with the target in this dataset. That can reflect clinical monitoring intensity and workflow as well as physiology.
 
 ### SHAP summary
 
@@ -384,38 +396,50 @@ This does not mean “a missing lactate causes sepsis.” It means the pattern o
 
 ![SHAP waterfall case](outputs/figures/shap_waterfall_case_positive.png)
 
-These plots make the repository useful as more than a leaderboard: they show **which physiological and temporal signals the model is using**.
-
 ---
 
 # 9. Early warning and alarm fatigue: `06_leadtime_alarm_fatigue.py`
 
-This is arguably the most clinically meaningful analysis in the repository because AUROC alone does not answer the question:
+This analysis asks:
 
 > **How much warning does the system actually provide?**
 
-Using the engineered model's operating threshold of **0.50**, the reported results are:
+Using the engineered model's operating threshold of **0.50**, the retained lead-time analysis reports:
 
-- **2,932 septic patients** in the lead-time analysis;
-- **87.6%** were caught by at least one alert before or at the first positive label hour;
-- median lead time among caught patients: **22.0 hours**;
-- **68.6%** of caught patients were warned at least **6 hours** ahead.
+- **2,932 septic patients**
+- **87.6%** caught by at least one alert before or at the first positive label hour
+- median lead time among caught patients: **22.0 hours**
+- **68.6%** of caught patients warned at least **6 hours** ahead
 
-### Alarm fatigue comparison
+### Alarm-fatigue comparison
 
 At approximately matched sensitivity:
 
-| Rule | Sensitivity | Non-septic-hour false alarm rate |
-|---|---:|---:|
-| Naive SIRS ≥2 | 0.5061 | **0.2890** |
-| Engineered model, matched sensitivity | 0.5072 | **0.1268** |
-| Engineered model, operating point | **0.5998** | 0.1796 |
+| Rule | Threshold | Sensitivity | Non-septic-hour false alarm rate |
+|---|---:|---:|---:|
+| Naive SIRS ≥2 | — | 0.5061 | **0.2890** |
+| Engineered model, matched sensitivity | 0.5688 | 0.5072 | **0.1268** |
+| Engineered model, operating point | 0.5000 | **0.5998** | 0.1796 |
 
 At matched sensitivity, the engineered model's reported non-septic-hour false-alarm rate is therefore less than half the SIRS-style comparator's:
 
 **0.1268 vs 0.2890.**
 
-That is a strong result for an early-warning system because an alarm that is rarely trusted is not operationally useful, even if its AUROC is high.
+### Alarm episode analysis
+
+The retained outputs now go beyond hourly alert counts and group consecutive alerts into alarm episodes.
+
+| Model | Threshold | Alert hours | Alarm episodes | TP episodes | FP episodes | Septic patients with ≥1 TP episode | FP episodes / 1,000 patient-days |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Baseline | 0.5408 | 299,594 | 50,248 | 2,844 | 47,404 | 76.16% | 746.38 |
+| **Engineered** | **0.5000** | **289,124** | **47,228** | **2,910** | **44,318** | **80.76%** | **697.79** |
+| TabNet | 0.5817 | 279,441 | 59,752 | 3,003 | 56,749 | 78.44% | 893.51 |
+| GRU-D | 0.5817 | 36,924 | 5,041 | 317 | 4,724 | 64.57% | 501.34 |
+| Transformer | 0.6633 | 42,408 | 5,825 | 422 | 5,403 | 81.35% | 573.40 |
+
+The engineered model reduces alert hours and alarm episodes relative to the raw baseline while increasing the number of septic patients with at least one true-positive episode.
+
+![Alarm episode analysis](outputs/figures/alarm_episode_analysis.png)
 
 ### Important interpretation of “22 hours”
 
@@ -429,23 +453,23 @@ It is the median difference between the first model alert and the first `SepsisL
 
 The repository also evaluates simpler classifiers using the same raw-versus-engineered framing.
 
-| Model | AUROC | AUPRC | Utility |
-|---|---:|---:|---:|
-| Decision Tree — engineered | 0.7152 | 0.0540 | 0.2065 |
-| Naive Bayes — engineered | 0.7093 | 0.0387 | 0.1431 |
-| Decision Tree — raw | 0.7056 | 0.0476 | 0.1793 |
-| Naive Bayes — raw | 0.6957 | 0.0367 | 0.1410 |
+| Model | AUROC | AUPRC | Utility | Features |
+|---|---:|---:|---:|---:|
+| Decision Tree — engineered | 0.7152 | 0.0540 | 0.2065 | 289 |
+| Naive Bayes — engineered | 0.7093 | 0.0387 | 0.1431 | 289 |
+| Decision Tree — raw | 0.7056 | 0.0476 | 0.1793 | 15 |
+| Naive Bayes — raw | 0.6957 | 0.0367 | 0.1410 | 15 |
 
 This reinforces two points:
 
 1. the engineered representation is useful across model families;
-2. the XGBoost learner is considerably stronger than these simpler classical baselines on this task.
+2. XGBoost is considerably stronger than these simpler classical baselines on this task.
 
 ---
 
 # 11. Deep learning phase
 
-Phase 6 asks a different question:
+Phase 6 asks:
 
 > **Can sequence models learn the temporal and missingness structure more effectively than the engineered tree model?**
 
@@ -457,7 +481,7 @@ GRU-D receives the raw 34 variables and explicitly models missingness through le
 
 ### TabNet
 
-TabNet receives the engineered 289-feature table, making it a more direct architectural competitor to engineered XGBoost.
+TabNet receives the engineered 289-feature table, making it a direct architectural competitor to engineered XGBoost.
 
 ### Transformer
 
@@ -471,47 +495,59 @@ A causal attention mask ensures that an hour cannot attend to future hours.
 
 ---
 
-# 12. GRU-D: `16_grud_model.py`
+# 12. GRU-D: `16_grud_model_kaggle.py`
 
-The reported GRU-D experiment uses:
+The current retained GRU-D run uses the **full 40,336-patient population**, rather than the earlier 20,000-patient laptop-RAM workaround.
 
-- **20,000 patients**;
-- 14,000 train / 3,000 validation / 3,000 test;
-- 34 raw variables;
-- maximum sequence length 336 hours;
-- hidden size 64;
-- early stopping on validation AUPRC.
+### Split
+
+- **28,235 train patients**
+- **6,050 validation patients**
+- **6,051 test patients**
+- patient-level 70/15/15 split
+- stratified on ever-septic status
+- 34 raw variables
+- maximum sequence length 336 hours
+- hidden size 64
+- early stopping on validation AUPRC
 
 ### Result
 
 | Metric | GRU-D |
 |---|---:|
-| AUROC | **0.7605** |
-| AUPRC | **0.0661** |
-| Utility | **0.2854** |
-| Threshold | 0.50 |
+| AUROC | **0.7387** |
+| AUPRC | **0.0591** |
+| Utility | **0.2374** |
+| Validation-locked threshold | **0.6225** |
+| Features | 34 |
+| Train patients | 28,235 |
+| Validation patients | 6,050 |
+| Test patients | 6,051 |
+| Epochs | 13 |
 
-On the same 114,486 paired test predictions used for the deep-model comparison, engineered XGBoost scores 0.7923 AUROC versus 0.7605 for GRU-D. DeLong's test reports a statistically significant difference.
+The threshold was selected on validation data and then applied once to the untouched test set. The test utility at the locked threshold is **0.2374**.
 
 ### Learned decay interpretation
 
-The model also records learned `gamma_x` values. Lower gamma means faster decay of stale information.
+Lower `gamma_x` means faster learned decay of stale information.
 
-An interesting result is that the GRU-D decay ranking does **not** simply reproduce the SHAP ranking:
+The current learned-decay ranking differs sharply from the hand-engineered SHAP ranking:
 
-- Lactate is fastest-decay rank **34/34**;
-- Bilirubin_total is rank **29/34**;
-- yet their hand-engineered `hours_since_last` features rank **#3** and **#6** by SHAP.
+- Lactate is only **27/34** by fastest learned decay;
+- Bilirubin_total is **23/34** by fastest learned decay;
+- yet `Lactate_hours_since_last` and `Bilirubin_total_hours_since_last` rank **#3** and **#6** in the XGBoost SHAP ranking.
 
-This is scientifically useful rather than a failure: the engineered XGBoost and GRU-D are extracting temporal missingness information in different ways.
+![GRU-D decay rates](outputs/figures/grud_decay_rates.png)
+
+This is scientifically useful rather than a failure: the engineered XGBoost and GRU-D extract temporal missingness information in different ways.
 
 ---
 
-# 13. TabNet: `17_tabnet_model_kaggle (full).py`
+# 13. TabNet: `17_tabnet_model_kaggle.py`
 
-The repository contains an older TabNet run and a newer full OOF run. The **newer `tabnet_results(full).csv` is treated as the authoritative TabNet result** in this README.
+The current TabNet run is the full-population 5-fold OOF experiment.
 
-### Full OOF result
+### Result
 
 | Metric | TabNet |
 |---|---:|
@@ -520,138 +556,163 @@ The repository contains an older TabNet run and a newer full OOF run. The **newe
 | Utility | **0.2687** |
 | Features | 289 |
 
-Relative to engineered XGBoost:
+Relative to the current engineered XGBoost:
 
-- XGBoost AUROC: 0.7918
-- TabNet AUROC: 0.7597
-- absolute gap: approximately **0.0322 AUROC**
+- XGBoost AUROC = **0.7926**
+- TabNet AUROC = **0.7597**
+- absolute gap ≈ **0.0329 AUROC**
 
-The TabNet feature-importance ranking has a modest but statistically detectable Spearman association with the XGBoost SHAP ranking:
+### TabNet feature importance
 
-- Spearman ρ = **0.1891**
-- p = **0.00124**
-- top-15 overlap = **4 / 15**
+The top current TabNet features are:
 
-This suggests that the two models share some signal but organize feature importance differently.
+| Rank | Feature | Importance |
+|---:|---|---:|
+| 1 | `Lactate_hours_since_last` | 0.1766 |
+| 2 | `Temp_mean_6h` | 0.0909 |
+| 3 | `BUN_velocity_1h` | 0.0858 |
+| 4 | `Bilirubin_total_hours_since_last` | 0.0657 |
+| 5 | `Resp_mean_12h` | 0.0643 |
+| 6 | `HR_mean_3h` | 0.0359 |
+| 7 | `Platelets_hours_since_last` | 0.0301 |
+| 8 | `Creatinine_std_12h` | 0.0293 |
+| 9 | `MAP_min_3h` | 0.0284 |
+| 10 | `Temp_max_3h` | 0.0188 |
+| 11 | `BUN_max_3h` | 0.0188 |
+| 12 | `Resp_mean_3h` | 0.0183 |
+| 13 | `Lactate_std_12h` | 0.0177 |
+| 14 | `WBC_std_3h` | 0.0150 |
+| 15 | `WBC_ffill` | 0.0148 |
+
+![TabNet feature importance](outputs/figures/tabnet_feature_importance.png)
+
+The current run's paired OOF comparison reports an AUROC difference between engineered XGBoost and TabNet of **0.0329**, with z ≈ **31.07** and p reported as 0 at machine precision.
 
 ---
 
-# 14. Causal Transformer: `18_transformer_model.py`
+# 14. Causal Transformer: `18_transformer_model_kaggle.py`
 
-The Transformer is the strongest model reported in the repository.
+The current Transformer run is also a **full-population** experiment.
 
 ### Architecture
 
-- 34 raw physiological variables;
-- value + mask + delta input channels;
-- input projection to 64 dimensions;
-- sinusoidal positional encoding;
-- 2 Transformer encoder layers;
-- 4 attention heads;
-- feed-forward dimension 128;
-- dropout 0.2;
-- causal attention mask;
-- 73,601 trainable parameters;
-- maximum sequence length 336 hours.
+- 34 raw physiological variables
+- value + mask + delta input channels
+- input projection to 64 dimensions
+- sinusoidal positional encoding
+- 2 Transformer encoder layers
+- 4 attention heads
+- feed-forward dimension 128
+- dropout 0.2
+- causal attention mask
+- **73,601 trainable parameters**
+- maximum sequence length 336 hours
 
-The model uses a patient-level 70/15/15 split over the same 20,000-patient stratified cohort used for GRU-D.
+### Patient-level split
 
-### Result
+- **28,235 train**
+- **6,050 validation**
+- **6,051 test**
+- 70/15/15 patient-level split
+- stratified on ever-septic status
+
+This replaces the older 20,000-patient Transformer experiment documented in the previous README.
+
+### Current result
 
 | Metric | Transformer |
 |---|---:|
-| **AUROC** | **0.8230** |
-| **AUPRC** | **0.1349** |
-| **Utility** | **0.3809** |
-| Best threshold | 0.6225 |
+| **AUROC** | **0.8095** |
+| **AUPRC** | **0.0984** |
+| **Utility** | **0.3597** |
+| Validation-locked threshold | **0.7042** |
 | Parameters | 73,601 |
+| Features | 34 |
+| Test patients | 6,051 |
+| Epochs | 8 |
 
-### Transformer vs XGBoost
-
-On the shared 3,000-patient deep-learning test set and **114,486 paired hourly predictions**:
-
-- XGBoost AUROC = **0.7923**
-- Transformer AUROC = **0.8230**
-- ΔAUC (XGB − Transformer) = **−0.0307**
-- 95% CI = **[−0.0400, −0.0213]**
-- p = **1.21 × 10⁻¹⁰**
-
-The result is statistically significant under the paired DeLong comparison.
-
-### Transformer vs GRU-D
-
-On exactly the same patients and predictions:
-
-- GRU-D AUROC = **0.7605**
-- Transformer AUROC = **0.8230**
-- ΔAUC = **−0.0625**
-- 95% CI = **[−0.0725, −0.0524]**
-- p effectively 0 at the reported precision.
+The threshold was selected on the validation split and then applied once to the untouched test split. Validation utility at the selected threshold was **0.3938**; test utility was **0.3597**.
 
 ### Attention behavior
 
-The mean attention analysis shows strong recency bias:
+The mean attention analysis shows strong recency bias.
 
-| Relative lag | Mean attention weight |
+| Lag | Mean attention weight |
 |---:|---:|
-| 0 h | **0.1231** |
-| 1 h | 0.1002 |
-| 2 h | 0.0847 |
-| 3 h | 0.0740 |
-| 4 h | 0.0638 |
-| 5 h | 0.0557 |
-| 6 h | 0.0493 |
-| 7 h | 0.0450 |
-| 8 h | 0.0417 |
-| 9 h | 0.0396 |
-| 10 h | 0.0377 |
-| 11 h | 0.0357 |
+| 0 h | **0.1104** |
+| 1 h | 0.0825 |
+| 2 h | 0.0711 |
+| 3 h | 0.0640 |
+| 4 h | 0.0574 |
+| 5 h | 0.0518 |
+| 6 h | 0.0472 |
+| 7 h | 0.0437 |
+| 8 h | 0.0412 |
+| 9 h | 0.0394 |
+| 10 h | 0.0374 |
+| 11 h | 0.0351 |
 
 The most-attended lag is **0 hours**, meaning the learned representation is strongly recency-biased while still being able to attend to earlier history.
+
+![Transformer attention by lag](outputs/figures/transformer_attention_by_lag.png)
+
+### Occlusion analysis
+
+A new retained analysis masks the trailing `N` hours before each patient's reference point.
+
+| Occlusion window | Mean |Δp|, septic | AUROC after occlusion | Septic alarm rate after occlusion |
+|---:|---:|---:|---:|---:|
+| 1 h | 0.0553 | 0.7536 | 0.3893 |
+| 2 h | 0.0663 | 0.7505 | 0.3706 |
+| 3 h | 0.0727 | 0.7476 | 0.3706 |
+| 6 h | 0.0946 | 0.7379 | 0.3333 |
+| 12 h | 0.1304 | 0.7186 | 0.3007 |
+| 24 h | 0.1580 | 0.7026 | 0.2821 |
+| 48 h | 0.1795 | 0.7290 | 0.2774 |
+
+The effect grows as recent history is removed: masking the trailing 24 hours changes septic-patient probabilities by an average of **0.1580** and reduces reference-point AUROC from **0.7618 to 0.7026**.
+
+![Transformer occlusion by window](outputs/figures/transformer_occlusion_by_window.png)
 
 ---
 
 # 15. How to read the model leaderboard correctly
 
-A common mistake would be to put all seven model numbers into one table and declare the Transformer “better” solely because 0.8230 > 0.7918.
-
-The repository contains **different evaluation contracts**:
+The current deep-learning runs are **not** the same experiment as the main XGBoost OOF evaluation.
 
 ### XGBoost / classical models
 
 - full population;
 - patient-grouped 5-fold OOF evaluation;
-- approximately 40,336 patients;
+- 40,336 patients;
 - approximately 1.55M hourly predictions.
 
 ### GRU-D / Transformer
 
-- fixed stratified **20,000-patient** cohort;
-- 70/15/15 patient split;
-- 14k train / 3k validation / 3k test;
+- full 40,336-patient cohort;
+- patient-level 70/15/15 split;
+- 28,235 train / 6,050 validation / 6,051 test;
 - early stopping;
-- same deep-learning test patients for direct GRU-D/Transformer comparison.
+- same held-out test patients for the two current sequence-model experiments.
 
-### TabNet full run
+### TabNet
 
-- newer full OOF run;
-- same engineered feature table as XGBoost;
-- treated separately from the older local/subsampled TabNet output.
+- full-population 5-fold OOF;
+- same engineered 289-feature table as XGBoost.
 
 Therefore the most defensible statements are:
 
 1. **Engineered XGBoost clearly improves over its raw-snapshot baseline.**
-2. **Engineered XGBoost is stronger than GRU-D and TabNet under their reported comparisons.**
-3. **The causal Transformer is the strongest model in the reported deep-learning test experiment.**
-4. **The Transformer-vs-XGBoost comparison is statistically supported on the shared 3,000-patient test cohort, but the full-population XGBoost OOF score and the Transformer test score should not be treated as identical evaluation populations.**
+2. **Engineered XGBoost is stronger than TabNet and the current GRU-D run under their reported OOF/test protocols.**
+3. **The current causal Transformer is the strongest reported deep-learning model.**
+4. **The Transformer test result should not be compared to the full-population XGBoost OOF number as if they were identical evaluation populations.**
+5. **The old README's 20,000-patient Transformer/GRU-D numbers are superseded by the current full-population runs.**
 
 ---
 
 # 16. Cross-hospital generalization: `14_cross_hospital_generalization.py`
 
 A major question for clinical ML is whether a model trained in one institution transfers to another.
-
-The repository performs two directions:
 
 | Train → Test | AUROC | AUPRC | Utility | AUROC drop |
 |---|---:|---:|---:|---:|
@@ -673,21 +734,15 @@ The fairness analysis evaluates the engineered model without retraining separate
 
 ### AUROC gaps
 
-| Axis | Highest | Lowest | Gap |
-|---|---:|---:|---:|
-| Hospital | 0.8084 | 0.7718 | **0.0366** |
-| Age | 0.8015 | 0.7811 | **0.0204** |
-| Gender | 0.7920 | 0.7915 | **0.0005** |
+| Axis | Highest group | Highest AUROC | Lowest group | Lowest AUROC | Gap |
+|---|---|---:|---|---:|---:|
+| Hospital | hospital_system_2 | 0.8084 | hospital_system_1 | 0.7718 | **0.0366** |
+| Age | 60–74 | 0.8015 | 75+ | 0.7811 | **0.0204** |
+| Gender | Female | 0.7920 | Male | 0.7915 | **0.0005** |
 
-### Interpretation
+Gender performance is extremely close in AUROC. Age differences are small but non-zero. The largest measured gap is across hospital systems, reinforcing the cross-hospital generalization result.
 
-Gender performance is extremely close in AUROC.
-
-Age differences are small but non-zero.
-
-The largest measured gap is across hospital systems, reinforcing the cross-hospital generalization result: **site effects appear more important than gender effects in this evaluation.**
-
-These are performance audits, not claims of complete fairness. The available demographic variables and the retrospective dataset cannot establish fairness across every clinically relevant population.
+These are performance audits, not claims of complete fairness. The available demographic variables and retrospective dataset cannot establish fairness across every clinically relevant population.
 
 ![Fairness audit](outputs/figures/fairness_audit_engineered.png)
 
@@ -695,11 +750,11 @@ These are performance audits, not claims of complete fairness. The available dem
 
 # 18. Conformal uncertainty: `15_conformal_prediction.py`
 
-The conformal analysis asks a different question:
+The conformal analysis asks:
 
 > When should the system make a confident statement, and when should it admit uncertainty?
 
-At a nominal confidence level of **90%**, the reported results are:
+At a nominal confidence level of **90%**:
 
 | Measure | Result |
 |---|---:|
@@ -713,7 +768,7 @@ At a nominal confidence level of **90%**, the reported results are:
 | Utility, full cohort | 0.3217 |
 | Utility, confident-only | **0.3871** |
 
-The confident-only utility being higher is suggestive of a useful selective-prediction strategy: **the model's strongest predictions are more operationally useful than forcing a hard answer on every hour.**
+The confident-only utility being higher is suggestive of a useful selective-prediction strategy: the model's strongest predictions are more operationally useful than forcing a hard answer on every hour.
 
 Coverage remains distribution-dependent and should not be interpreted as a universal guarantee after deployment in a new hospital.
 
@@ -725,9 +780,9 @@ The association-rule analysis converts selected physiological variables into abn
 
 The run contains:
 
-- 1,552,210 patient-hour rows;
-- 374 rules overall;
-- 28 rules with Sepsis as the consequent.
+- **1,552,210 patient-hour rows**
+- **374 rules overall**
+- **28 rules with Sepsis as the consequent**
 
 The strongest reported sepsis-consequent rule is:
 
@@ -735,7 +790,7 @@ The strongest reported sepsis-consequent rule is:
 Resp_high + Temp_abnormal → Sepsis
 ```
 
-with approximately:
+with:
 
 - support = 0.00206
 - confidence = 0.0509
@@ -753,7 +808,7 @@ with lift ≈ **2.82**.
 
 Association rules are **descriptive**, not causal.
 
-A lift above 1 means the combination occurs with the target more often than would be expected under the rule's baseline independence reference. It does not establish that one physiological abnormality causes sepsis or that the rule should be used as a clinical decision rule.
+A lift above 1 means the combination occurs with the target more often than expected under the rule's baseline independence reference. It does not establish that one physiological abnormality causes sepsis or that the rule should be used as a clinical decision rule.
 
 ---
 
@@ -777,22 +832,22 @@ The relatively low hierarchical silhouette indicates that the discovered cluster
 
 ![Cluster silhouette](outputs/figures/cluster_silhouette.png)
 
-The project should therefore treat these clusters as **exploratory phenotype structure**, not as clinically established patient subtypes.
+The project should therefore treat these clusters as **exploratory phenotype structure**, not clinically established patient subtypes.
 
 ## DBSCAN
 
 The DBSCAN run uses:
 
-- 32,465 patients;
-- epsilon ≈ 3.5512;
-- minimum samples = 10;
-- 1 dominant cluster;
-- 662 noise points;
-- 2.04% noise.
+- 32,465 patients
+- epsilon ≈ 3.5512
+- minimum samples = 10
+- 1 dominant cluster
+- 662 noise points
+- 2.04% noise
 
 ![DBSCAN k-distance elbow](outputs/figures/dbscan_kdistance_elbow.png)
 
-Interestingly, the DBSCAN noise group has a higher observed sepsis rate than the dominant cluster. This suggests that some physiologically unusual patients may occupy a sparse region of feature space, but again this is an exploratory association rather than a diagnostic classifier.
+The DBSCAN noise group has a higher observed sepsis rate than the dominant cluster. This suggests that some physiologically unusual patients may occupy a sparse region of feature space, but this remains an exploratory association rather than a diagnostic classifier.
 
 ---
 
@@ -840,7 +895,7 @@ Reported outputs include:
 - **2,438** rows in the example hospital + septic + lactate > 2 dice;
 - Power BI fact export with **1,552,210 rows × 15 columns**.
 
-The exported tables are designed to support downstream dashboards without making the dashboard layer responsible for rebuilding the clinical feature engineering pipeline.
+The exported tables are designed to support downstream dashboards without making the dashboard layer responsible for rebuilding the clinical feature-engineering pipeline.
 
 See `POWERBI_HANDOFF.md` for the dashboard-side workflow.
 
@@ -858,7 +913,7 @@ AUPRC is emphasized because the positive class is rare. It focuses attention on 
 
 ## Normalized utility
 
-`utility_score.py` implements a vectorized version of the official PhysioNet/CinC 2019 utility framework. The implementation is documented as verified against the Challenge reference implementation.
+`utility_score.py` implements a vectorized version of the official PhysioNet/CinC 2019 utility framework.
 
 The configured timing parameters are:
 
@@ -883,15 +938,13 @@ The normalized score is scaled so that:
 - doing nothing is 0;
 - a model can score below 0 if it is worse than inaction.
 
-This metric rewards timely warnings and penalizes false alarms, which is why it is particularly relevant to early-warning systems.
-
-The utility implementation explicitly evaluates each patient's **chronological sequence**, rather than treating rows as independent classification events.
+The implementation evaluates each patient's chronological sequence rather than treating rows as independent classification events.
 
 ## DeLong's test
 
-`delong.py` implements the fast DeLong method for comparing **correlated ROC AUCs**. This is appropriate when two models produce predictions for the same held-out rows.
+`delong.py` implements the fast DeLong method for comparing correlated ROC AUCs. It is appropriate when two models produce predictions for the same held-out rows.
 
-The Transformer comparisons use this paired structure, which is why the reported significance tests are more informative than simply subtracting two independently estimated AUROCs.
+Where paired predictions are available, this is preferable to simply subtracting independently estimated AUROCs.
 
 ---
 
@@ -915,15 +968,101 @@ The Transformer standardizes variables using training-set statistics and uses th
 
 GRU-D and Transformer split patients rather than hourly rows into train/validation/test groups.
 
+The current full-population sequence split is:
+
+- train: **28,235 patients**
+- validation: **6,050 patients**
+- test: **6,051 patients**
+
+### Calibration split discipline
+
+The new recalibration stage adds another separation rule:
+
+- OOF models: a deterministic **70/30 patient-level calibration fit/evaluation split**;
+- sequence models: calibration is fit on the **validation set** and evaluated on the untouched **test set**.
+
+The calibration script explicitly avoids fitting Platt scaling on the same rows used to evaluate the calibrated probabilities.
+
 ### What is still important to validate
 
-No retrospective pipeline can completely remove all sources of dataset construction bias. The `SepsisLabel` target itself is generated according to the Challenge's labeling process, and clinical workflow can influence what measurements are available.
+No retrospective pipeline can completely remove all sources of dataset-construction bias. The `SepsisLabel` target is generated according to the Challenge's labeling process, and clinical workflow can influence what measurements are available.
 
-That is why the repository's claims should remain about **benchmark performance on this dataset**, not prospective clinical efficacy.
+Therefore, repository claims should remain about **benchmark performance on this dataset**, not prospective clinical efficacy.
 
 ---
 
-# 25. The central scientific story
+# 25. Calibration and post-hoc probability correction: `19_recalibration.py`
+
+This is the major new analysis added after the earlier README.
+
+The pre-recalibration diagnostics showed that raw probabilities were badly calibrated. For example, on held-out evaluation data:
+
+| Model | Raw Brier | Raw calibration intercept | Raw calibration slope |
+|---|---:|---:|---:|
+| Baseline | 0.1606 | -3.748 | 0.940 |
+| Engineered XGBoost | 0.1365 | -3.635 | 1.009 |
+| TabNet | 0.1694 | -3.823 | 0.823 |
+| GRU-D | 0.1977 | -3.966 | 1.186 |
+| Transformer | 0.1879 | -4.061 | 0.820 |
+
+The raw Brier scores are far above the no-skill Brier of roughly **0.0174–0.0177**, showing severe probability miscalibration despite useful ranking performance.
+
+## Method
+
+`19_recalibration.py` applies **Platt scaling**:
+
+```text
+logit(p_calibrated) = a * logit(p_raw) + b
+```
+
+The calibrator is fitted only on a disjoint patient-level fit split and then applied to the held-out evaluation split.
+
+This preserves ranking because Platt scaling is monotonic, so AUROC should remain unchanged.
+
+## Before vs. after calibration
+
+| Model | Brier raw | Brier calibrated | Intercept raw | Intercept calibrated | Slope raw | Slope calibrated | AUROC |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Baseline | 0.1606 | **0.0173** | -3.748 | -0.012 | 0.940 | 0.987 | 0.7525 |
+| Engineered | 0.1365 | **0.0171** | -3.635 | 0.057 | 1.009 | 1.005 | 0.7919 |
+| TabNet | 0.1694 | **0.0173** | -3.823 | 0.045 | 0.823 | 1.004 | 0.7571 |
+| GRU-D | 0.1977 | **0.0171** | -3.966 | -0.431 | 1.186 | 0.867 | 0.7387 |
+| Transformer | 0.1879 | **0.0167** | -4.061 | -0.178 | 0.820 | 0.920 | 0.8095 |
+
+The result is clear:
+
+- calibration substantially improves Brier score;
+- calibration intercepts move much closer to 0;
+- calibration slopes move closer to 1;
+- AUROC is unchanged, as expected for a monotonic probability transformation.
+
+![Calibration curves before and after](outputs/figures/calibration_curves_recalibrated.png)
+
+## Threshold re-lock
+
+Calibration changes the numerical scale of the probabilities, so the old raw thresholds cannot simply be reused.
+
+Thresholds were therefore re-selected on the calibration-fit/validation side and locked before evaluation.
+
+| Model | Raw threshold | Eval utility at raw threshold | Calibrated threshold | Eval utility at calibrated threshold |
+|---|---:|---:|---:|---:|
+| Baseline | 0.5408 | 0.2432 | **0.0508** | 0.1682 |
+| Engineered | 0.5000 | 0.3200 | **0.0508** | 0.2479 |
+| TabNet | 0.5817 | 0.2641 | **0.0508** | 0.1857 |
+| GRU-D | 0.6225 | 0.2374 | **0.0508** | 0.1946 |
+| Transformer | 0.7042 | 0.3597 | **0.0508** | 0.3037 |
+
+This produces an important methodological result:
+
+> **Better probability calibration does not automatically mean higher PhysioNet utility at the same operating policy.**
+
+The calibrated probabilities are much more statistically faithful, but utility is threshold- and workflow-dependent. A deployment-oriented system would need to optimize the operating point after calibration under an explicit alert-rate/workflow constraint rather than assuming that the threshold maximizing retrospective utility on raw scores remains appropriate.
+
+The retained `calibration_split_manifest.csv` documents the patient IDs used for calibration-fit versus calibration-evaluation splits.
+
+---
+
+# 26. The central scientific story
 
 The project can be summarized as a sequence of increasingly demanding questions.
 
@@ -937,7 +1076,7 @@ Raw XGBoost reaches **0.7572 AUROC**.
 
 **Answer:** yes.
 
-Adding rolling statistics, trends, missingness, and clinical composites raises XGBoost to **0.7918 AUROC** and **0.0821 AUPRC**.
+Adding rolling statistics, trends, missingness, and clinical composites raises XGBoost to **0.7926 AUROC** and **0.0834 AUPRC**.
 
 ### Question 3 — Which temporal representation matters most?
 
@@ -945,11 +1084,11 @@ Adding rolling statistics, trends, missingness, and clinical composites raises X
 
 ### Question 4 — Does the model use clinically meaningful information?
 
-**Answer:** the SHAP results show strong contributions from lactate, SIRS-like state, temperature, respiratory behavior, bilirubin, BUN, potassium, and shock index, along with measurement-recency features.
+**Answer:** the SHAP results show strong contributions from lactate, SIRS-like state, temperature, respiratory behavior, bilirubin, BUN, potassium, shock index, and measurement-recency features.
 
 ### Question 5 — Does this translate into earlier warning?
 
-**Answer:** in the retrospective label-based analysis, 87.6% of septic patients were caught before or at the first positive label, with a median lead time of 22 hours among caught patients.
+**Answer:** in the retrospective label-based analysis, **87.6%** of septic patients were caught before or at the first positive label, with a **22-hour median label-based lead time** among caught patients.
 
 ### Question 6 — Can it reduce alarm burden?
 
@@ -961,7 +1100,7 @@ Adding rolling statistics, trends, missingness, and clinical composites raises X
 
 ### Question 8 — Is performance uniform across groups?
 
-**Answer:** gender performance is almost identical; age and especially hospital show larger differences.
+**Answer:** gender performance is almost identical; age differences are modest; hospital differences are larger.
 
 ### Question 9 — Does uncertainty information help?
 
@@ -969,13 +1108,21 @@ Adding rolling statistics, trends, missingness, and clinical composites raises X
 
 ### Question 10 — Can deep sequence models beat the tree?
 
-**Answer:** GRU-D and TabNet do not beat engineered XGBoost in the reported experiments, but the **causal Transformer does**, reaching **0.8230 AUROC / 0.1349 AUPRC / 0.3809 utility** on its 3,000-patient held-out test set.
+**Answer:** the current GRU-D does not beat engineered XGBoost, while the current causal Transformer reaches **0.8095 AUROC / 0.0984 AUPRC / 0.3597 utility** on its 6,051-patient held-out test set.
+
+### Question 11 — Are the model outputs calibrated?
+
+**Answer:** not before recalibration. Raw probabilities are substantially overconfident, but held-out Platt scaling reduces Brier scores to approximately **0.0167–0.0173** while preserving AUROC.
+
+### Question 12 — Does calibration solve threshold selection?
+
+**Answer:** no. Calibration changes the probability scale and therefore requires a new operating threshold. In this run, the calibrated threshold was approximately **0.0508**, and the resulting held-out utility was lower than the old raw-threshold utility for every evaluated model. This shows why calibration and operational thresholding should be treated as separate decisions.
 
 ---
 
-# 26. Main strengths
+# 27. Main strengths
 
-1. **End-to-end architecture:** data warehouse → features → models → evaluation → interpretability → deployment-oriented analyses.
+1. **End-to-end architecture:** data warehouse → features → models → evaluation → interpretability → calibration → deployment-oriented analyses.
 2. **Patient-grouped evaluation:** avoids the most obvious repeated-measures leakage failure.
 3. **Causal temporal features:** rolling windows do not look forward.
 4. **Multiple metrics:** AUROC, AUPRC and a clinical utility metric are all reported.
@@ -983,15 +1130,18 @@ Adding rolling statistics, trends, missingness, and clinical composites raises X
 6. **Interpretability:** SHAP connects model performance to specific variables and temporal patterns.
 7. **Early-warning analysis:** the project measures lead time rather than stopping at discrimination.
 8. **Alarm-fatigue analysis:** compares false-alarm burden with a simple SIRS-style rule.
-9. **External-site stress test:** cross-hospital validation exposes meaningful distribution shift.
-10. **Fairness audit:** age, gender and hospital subgroup performance are explicitly measured.
-11. **Uncertainty analysis:** conformal prediction adds selective-confidence information.
-12. **Model diversity:** tree, classical, TabNet, recurrent and Transformer architectures are compared.
-13. **Analytical warehouse layer:** OLAP and Power BI exports connect ML to practical analytics workflows.
+9. **Alarm-episode analysis:** groups repeated alerts into episodes and reports episode-level burden.
+10. **External-site stress test:** cross-hospital validation exposes meaningful distribution shift.
+11. **Fairness audit:** age, gender and hospital subgroup performance are explicitly measured.
+12. **Uncertainty analysis:** conformal prediction adds selective-confidence information.
+13. **Probability calibration:** Platt scaling corrects severe raw probability miscalibration using disjoint patient splits.
+14. **Model diversity:** tree, classical, TabNet, recurrent and Transformer architectures are compared.
+15. **Transformer temporal analysis:** attention-by-lag and trailing-window occlusion provide complementary temporal diagnostics.
+16. **Analytical warehouse layer:** OLAP and Power BI exports connect ML to practical analytics workflows.
 
 ---
 
-# 27. Limitations and what should happen next
+# 28. Limitations and what should happen next
 
 ### 1. Retrospective benchmark
 
@@ -1011,11 +1161,11 @@ Sepsis is rare at the patient-hour level. AUPRC and utility should therefore rem
 
 ### 5. Repeated hourly observations
 
-Hourly rows from a patient are temporally correlated. Patient grouping prevents direct train/test patient leakage, but it does not make the observations statistically independent.
+Hourly rows from a patient are temporally correlated. Patient grouping prevents direct patient leakage, but it does not make the observations statistically independent.
 
 ### 6. Deep-learning evaluation is not identical to XGBoost evaluation
 
-GRU-D and Transformer use the 20,000-patient fixed split, whereas the main XGBoost model uses full-population GroupKFold OOF evaluation. The README explicitly keeps these protocols separate.
+The current deep-learning models use a 70/15/15 patient split, whereas the main XGBoost and TabNet experiments use full-population OOF evaluation. The README keeps these protocols separate.
 
 ### 7. Clustering is exploratory
 
@@ -1029,37 +1179,42 @@ High lift indicates association, not intervention effect or mechanism.
 
 The audit covers the demographic/site variables represented in the data. It is not a complete fairness certification.
 
-### 10. Calibration and prospective thresholding
+### 10. Calibration is dataset-dependent
 
-The selected thresholds are useful for the reported retrospective experiments, but a real deployment would require calibration, workflow simulation, alert-frequency constraints, and prospective threshold selection.
+Platt scaling substantially improves held-out calibration in this benchmark, but calibration can drift under prevalence shift, hospital shift, workflow change, or temporal shift.
 
-### 11. Transformer result needs external validation
+### 11. Calibration does not determine the operational threshold
 
-The Transformer result is promising, but one held-out test split is not enough to establish general clinical superiority. Replication across temporal splits, institutions, and external datasets would be the natural next step.
+A calibrated probability is not automatically an optimal alarm policy. Thresholds must be selected under the intended utility, alert-rate, and workflow constraints.
+
+### 12. Transformer result needs external validation
+
+The Transformer result is promising, but one held-out patient split is not enough to establish clinical superiority. Replication across temporal splits, institutions, and external datasets is required.
 
 ---
 
-# 28. Recommended next research steps
+# 29. Recommended next research steps
 
-If this project were being taken from a strong capstone/research prototype toward a publication-grade system, the next priorities would be:
+The most useful next steps, in order, are:
 
 1. **External validation on another ICU dataset.**
-2. **Temporal holdout validation** rather than only random patient splits.
+2. **Temporal holdout validation** rather than only patient-level random splits.
 3. **Repeated seeds / repeated patient splits** for the deep models.
-4. **Calibration curves and Brier score.**
-5. **Patient-level sensitivity and specificity at operational alert rates.**
-6. **Time-dependent precision/recall and lead-time distributions**, not only median lead time.
-7. **Decision-curve analysis / net benefit.**
-8. **Ablation of missingness alone versus value + missingness jointly.**
-9. **Transformer ablations:** values only vs values + mask vs values + mask + delta.
-10. **Transformer attention stability across seeds and patients.**
-11. **Hospital-specific calibration and threshold analysis.**
-12. **Prospective-style alarm simulation**, including repeated-alert suppression and cooldown periods.
+4. **Hospital-specific calibration** and threshold analysis.
+5. **Calibration under distribution shift** and prevalence shift.
+6. **Patient-level sensitivity and specificity at operational alert rates.**
+7. **Time-dependent precision/recall and lead-time distributions**, not only median lead time.
+8. **Decision-curve analysis / net benefit.**
+9. **Prospective-style alarm simulation**, including repeated-alert suppression and cooldown periods.
+10. **Transformer ablations:** values only vs values + mask vs values + mask + delta.
+11. **Transformer attention stability across seeds and patients.**
+12. **Ablation of missingness alone versus value + missingness jointly.**
 13. **More rigorous uncertainty evaluation under distribution shift.**
+14. **Calibration-aware threshold optimization** with explicit alert-frequency constraints.
 
 ---
 
-# 29. Reproducibility
+# 30. Reproducibility
 
 The intended execution order is approximately:
 
@@ -1067,7 +1222,7 @@ The intended execution order is approximately:
 python src/01_etl_warehouse.py
 python src/02_feature_engineering.py
 python src/03_baseline_model.py
-python src/04_engineered_model.py
+python src/04_engineered_model_kaggle.py
 python src/05_explainability.py
 python src/06_leadtime_alarm_fatigue.py
 python src/07_olap_and_export.py
@@ -1079,51 +1234,108 @@ python src/12_outlier_analysis.py
 python src/13_fairness_audit.py
 python src/14_cross_hospital_generalization.py
 python src/15_conformal_prediction.py
-python src/16_grud_model.py
-python "src/17_tabnet_model_kaggle (full).py"
-python src/18_transformer_model.py
+python src/16_grud_model_kaggle.py
+python src/17_tabnet_model_kaggle.py
+python src/18_transformer_model_kaggle.py
+python src/19_recalibration.py
 ```
 
 The deep-learning scripts require PyTorch in addition to the core scientific Python stack.
 
-The repository's generated `outputs/` directory is retained so that results can be inspected without retraining every model.
+The generated `outputs/` directory is retained so that results can be inspected without retraining every model.
+
+### Current deep-learning run note
+
+The retained GRU-D and Transformer logs show:
+
+- full population: **40,336 patients**
+- train: **28,235**
+- validation: **6,050**
+- test: **6,051**
+- stratification on ever-septic status
+- patient-level rather than hourly splitting.
+
+The older README's 20,000-patient deep-learning description is therefore no longer the current execution contract.
 
 ---
 
-# 30. Figures and generated evidence
+# 31. Figures and generated evidence
 
-The repository includes the major generated figures used to interpret the analysis:
+The current outputs contain the following generated figures.
 
-- SHAP global summary
-- SHAP dependence for shock index
-- SHAP dependence for partial SIRS
-- SHAP dependence for HR slope
-- SHAP waterfall case study
-- hierarchical dendrogram
-- clustering silhouette
-- DBSCAN k-distance elbow
-- outlier/sepsis lift
-- fairness audit
+### Explainability
 
-These are intentionally embedded here so the README is also a compact visual research report.
+![SHAP summary](outputs/figures/shap_summary.png)
+
+![Shock index SHAP dependence](outputs/figures/shap_dependence_shock_index.png)
+
+![Partial SIRS SHAP dependence](outputs/figures/shap_dependence_partial_sirs_score.png)
+
+![HR slope SHAP dependence](outputs/figures/shap_dependence_HR_slope_6h.png)
+
+![SHAP waterfall case](outputs/figures/shap_waterfall_case_positive.png)
+
+### Unsupervised analysis
+
+![Hierarchical dendrogram](outputs/figures/hierarchical_dendrogram.png)
+
+![Cluster silhouette](outputs/figures/cluster_silhouette.png)
+
+![DBSCAN k-distance elbow](outputs/figures/dbscan_kdistance_elbow.png)
+
+![Outlier sepsis lift](outputs/figures/outlier_sepsis_lift.png)
+
+### Fairness and deep learning
+
+![Fairness audit](outputs/figures/fairness_audit_engineered.png)
+
+![GRU-D decay rates](outputs/figures/grud_decay_rates.png)
+
+![TabNet feature importance](outputs/figures/tabnet_feature_importance.png)
+
+![Transformer attention by lag](outputs/figures/transformer_attention_by_lag.png)
+
+![Transformer occlusion by window](outputs/figures/transformer_occlusion_by_window.png)
+
+### Calibration and alarm analysis
+
+![Calibration curves before and after Platt scaling](outputs/figures/calibration_curves_recalibrated.png)
+
+![Alarm episode analysis](outputs/figures/alarm_episode_analysis.png)
+
+The earlier raw calibration diagnostic is also retained:
+
+![Raw calibration curves](outputs/figures/calibration_curves.png)
+
+These figures are generated from the retained `outputs/` artifacts and are intended to make the README function as a compact visual research report.
 
 ---
 
-# 31. Bottom line
+# 32. Bottom line
 
-This is a **good and substantial research prototype**, not merely a model-training script.
+This is a substantial research prototype, not merely a model-training script.
 
-The strongest parts are the causal temporal feature engineering, patient-level evaluation discipline, explicit ablations, clinical-utility scoring, early-warning analysis, cross-hospital stress testing, SHAP analysis, and the progression from XGBoost to GRU-D, TabNet, and a causal Transformer.
+The strongest parts are:
 
-The results tell a coherent story:
+- causal temporal feature engineering;
+- patient-level evaluation discipline;
+- explicit feature-family ablations;
+- clinical-utility scoring;
+- early-warning analysis;
+- alarm episode analysis;
+- cross-hospital stress testing;
+- SHAP analysis;
+- full-population deep-learning challengers;
+- Transformer temporal diagnostics;
+- and the newly added calibration/threshold analysis.
 
-> **Temporal context matters. Measurement timing matters. Rolling physiological behavior is more informative than a single snapshot. The engineered XGBoost model is a strong tabular baseline. Cross-hospital transfer is a real weakness. And in the later matched deep-learning experiment, the causal Transformer is the strongest reported architecture.**
+The current results tell a coherent story:
+
+> **Temporal context matters. Measurement timing matters. Rolling physiological behavior is more informative than a single snapshot. The engineered XGBoost model is a strong tabular baseline. Cross-hospital transfer is a real weakness. The current causal Transformer is the strongest reported deep-learning model. And raw model probabilities are substantially miscalibrated, making post-hoc calibration and threshold re-locking necessary before interpreting model scores as probabilities or designing an operational alarm policy.**
 
 The most important caveat is equally clear:
 
 > **These results demonstrate predictive performance on the PhysioNet 2019 benchmark; they do not by themselves establish prospective clinical effectiveness.**
-
-That distinction is what keeps the project scientifically credible.
 
 ---
 
@@ -1132,7 +1344,8 @@ That distinction is what keeps the project scientifically credible.
 - PhysioNet / Computing in Cardiology Challenge 2019 dataset and evaluation framework.
 - Che et al., *Recurrent Neural Networks for Multivariate Time Series with Missing Values*, Scientific Reports (GRU-D).
 - Vaswani et al., *Attention Is All You Need* (Transformer architecture).
-- Sun & Xu, *Fast Implementation of DeLong's Algorithm for Comparing the Areas Under Correlated Receiver Operating Characteristic Curves* (DeLong comparison).
+- Sun & Xu, *Fast Implementation of DeLong's Algorithm for Comparing the Areas Under Correlated Receiver Operating Characteristic Curves*.
+- Platt, *Probabilistic Outputs for Support Vector Machines and Comparisons to Regularized Likelihood Methods* (Platt scaling).
 
 ## License / data note
 
